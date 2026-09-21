@@ -89,6 +89,8 @@ struct ChatDetailView: View {
     @State private var scrollPosition: ScrollPosition = .init()
     /// True when the user has manually scrolled away from the bottom.
     @State private var isScrolledUp = false
+    /// Button visibility is separate from the intent to pause streaming auto-follow.
+    @State private var isNearBottom = true
     /// Curtain flag: keeps the message area invisible until messages are loaded
     /// AND the scroll position has been set to the bottom. Prevents the user
     /// from seeing skeleton → messages → scroll animation. Resets to false on
@@ -431,16 +433,46 @@ struct ChatDetailView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .chatChromeBar(edge: .top) {
-            // Removing the view from the tree (rather than just fading it) causes
-            // safeAreaBar / safeAreaInset to collapse to zero height, so the entire
-            // bar area disappears — not just the content inside it.
-            // All navBarHidden mutations are already wrapped in withAnimation(.easeOut)
-            // at the scroll-handler sites, so the transition animates automatically.
-            if !navBarHidden {
-                customTopBar
-                    .transition(
-                        .opacity.combined(with: .offset(y: -20))
+            VStack(spacing: 0) {
+                // Removing the view from the tree (rather than just fading it) causes
+                // safeAreaBar / safeAreaInset to collapse to zero height, so the entire
+                // bar area disappears — not just the content inside it.
+                // All navBarHidden mutations are already wrapped in withAnimation(.easeOut)
+                // at the scroll-handler sites, so the transition animates automatically.
+                if !navBarHidden {
+                    customTopBar
+                        .transition(
+                            .opacity.combined(with: .offset(y: -20))
+                        )
+                }
+                let ttsPlayer = dependencies.textToSpeechService.readAloudPlayer
+                let showAnyPlayer = ttsPlayer.isVisible
+                    || speakingMessageId != nil
+                    || ttsGeneratingMessageId != nil
+                if showAnyPlayer {
+                    ReadAloudPlayerBar(
+                        player: ttsPlayer.isVisible ? ttsPlayer : nil,
+                        readFromHere: { text in
+                            guard let messageID = ttsPlayer.messageID else { return }
+                            dependencies.textToSpeechService.speakMessage(
+                                text, messageID: messageID,
+                                title: ttsPlayer.title,
+                                serverSplitOn: dependencies.authViewModel.backendConfig?.audio?.tts?.splitOn)
+                        },
+                        isGenerating: ttsGeneratingMessageId != nil && speakingMessageId == nil,
+                        isPlaying: speakingMessageId != nil || ttsPlayer.isPlaying,
+                        onStop: {
+                            dependencies.textToSpeechService.stop()
+                            speakingMessageId = nil
+                            ttsGeneratingMessageId = nil
+                        },
+                        isUserScrolling: isFingerDriving
                     )
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .move(edge: .top)),
+                        removal: .opacity.combined(with: .move(edge: .top))
+                    ))
+                }
             }
         }
         .chatChromeBar(edge: .bottom) {
@@ -1567,6 +1599,7 @@ struct ChatDetailView: View {
         .overlay(alignment: chatScrollControls == .bottomOnly ? .bottom : .bottomTrailing) {
             scrollFABGroup
                 .animation(MicroAnimation.presence, value: isScrolledUp)
+                .animation(MicroAnimation.presence, value: isNearBottom)
                 .animation(MicroAnimation.presence, value: isAtTop)
         }
         .onAppear {
@@ -1746,6 +1779,13 @@ struct ChatDetailView: View {
         // stretching the parent scroll view horizontally.
         .frame(maxWidth: UIScreen.main.bounds.width, alignment: .leading)
         .clipped()
+        .background(alignment: .bottom) {
+            // Observe the final 80pt without adding padding or changing auto-follow.
+            Color.clear
+                .frame(height: 80)
+                .onScrollVisibilityChange(threshold: 0.01) { isNearBottom = $0 }
+                .allowsHitTesting(false)
+        }
         // Tapping anywhere in the empty chat area (below messages in short conversations)
         // should dismiss the keyboard. .scrollDismissesKeyboard(.interactively) only fires
         // on a scroll gesture — a plain tap is ignored when the content is shorter than the
@@ -2146,11 +2186,13 @@ struct ChatDetailView: View {
         }
     }
 
-    // MARK: - Scroll FAB Pill Group
+    // MARK: - Scroll Controls
 
     @ViewBuilder
     private var scrollFABGroup: some View {
-        if chatScrollControls != .hidden && isScrolledUp && !viewModel.messages.isEmpty && !viewModel.isLoadingConversation {
+        if chatScrollControls != .hidden && isScrolledUp
+            && (!isNearBottom || (windowEnd ?? viewModel.messages.count) < viewModel.messages.count)
+            && !viewModel.messages.isEmpty && !viewModel.isLoadingConversation {
             VStack(spacing: 0) {
                 // ↑ FAB — jumps to the previous user question on each tap
                 let total_fab = viewModel.messages.count
@@ -2230,26 +2272,14 @@ struct ChatDetailView: View {
                         }
                         Haptics.play(.light)
                     } label: {
-                        ZStack {
-                            Rectangle()
-                                .fill(.ultraThinMaterial)
-                                .frame(width: 38, height: 38)
-                            Image(systemName: "chevron.up")
-                                .scaledFont(size: 13, weight: .bold)
-                                .foregroundStyle(theme.textSecondary)
-                        }
+                        scrollFABLabel("chevron.up")
                     }
                     .buttonStyle(.plain)
                     .contentShape(Rectangle())
                     .accessibilityLabel("Jump to previous question")
-
-                    // Hairline divider between the two halves
-                    Rectangle()
-                        .fill(theme.cardBorder.opacity(0.4))
-                        .frame(width: 38, height: 0.5)
                 }
 
-                // ↓ FAB — always shown when isScrolledUp
+                // ↓ FAB — returns to the latest messages and resumes auto-follow.
                 Button {
                     isScrolledUp = false
                     isUserDriving = false
@@ -2284,26 +2314,12 @@ struct ChatDetailView: View {
                     }
                     Haptics.play(.light)
                 } label: {
-                    ZStack {
-                        Rectangle()
-                            .fill(.ultraThinMaterial)
-                            .frame(width: chatScrollControls == .bottomOnly ? 44 : 38,
-                                   height: chatScrollControls == .bottomOnly ? 44 : 38)
-                        Image(systemName: chatScrollControls == .bottomOnly ? "arrow.down" : "chevron.down")
-                            .scaledFont(size: 13, weight: .bold)
-                            .foregroundStyle(theme.textSecondary)
-                    }
+                    scrollFABLabel(chatScrollControls == .bottomOnly ? "arrow.down" : "chevron.down")
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Scroll to bottom")
             }
-            .clipShape(RoundedRectangle(cornerRadius: chatScrollControls == .bottomOnly ? 22 : 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: chatScrollControls == .bottomOnly ? 22 : 12, style: .continuous)
-                    .strokeBorder(theme.cardBorder.opacity(0.35), lineWidth: 0.5)
-            )
-            .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
             .padding(.trailing, chatScrollControls == .bottomOnly ? 0 : Spacing.md)
             .padding(.bottom, Spacing.sm)
             .transition(
@@ -2314,6 +2330,17 @@ struct ChatDetailView: View {
                 .animation(MicroAnimation.presence)
             )
         }
+    }
+
+    private func scrollFABLabel(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .scaledFont(size: 12, weight: .semibold)
+            .foregroundStyle(theme.textSecondary)
+            .frame(width: 32, height: 32)
+            .chatControlGlass(in: Circle(), fallback: .ultraThinMaterial)
+            // Keep the visual control small without shrinking its touch target.
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
     }
 
     // MARK: - Loading Placeholders
@@ -3460,6 +3487,7 @@ struct ChatDetailView: View {
         let preferences = MessageActionPreferences(order: messageActionOrder, hidden: hiddenMessageActions)
         let actions = preferences.visibleActions(
             speechActive: speakingMessageId == message.id || ttsGeneratingMessageId == message.id
+                || dependencies.textToSpeechService.readAloudPlayer.messageID == message.id
         )
 
         return HStack(spacing: 6) {
@@ -3562,14 +3590,17 @@ struct ChatDetailView: View {
                             .frame(width: 28, height: 28)
                             .tint(theme.brandPrimary)
                     } else {
+                        let player = dependencies.textToSpeechService.readAloudPlayer
+                        let isPlayerMessage = player.messageID == message.id
                         compactActionIcon(
-                            icon: speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2",
-                            isActive: speakingMessageId == message.id
-                        )
+                            icon: isPlayerMessage ? (player.wantsPlayback ? "pause.fill" : "play.fill")
+                                : (speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2"),
+                            isActive: isPlayerMessage || speakingMessageId == message.id)
                     }
                 }
                 .buttonStyle(CompactActionButtonStyle())
-                .accessibilityLabel(speakingMessageId == message.id ? "Stop speaking" : "Speak")
+                .accessibilityLabel(dependencies.textToSpeechService.readAloudPlayer.messageID == message.id
+                    ? "Toggle read-aloud playback" : (speakingMessageId == message.id ? "Stop speaking" : "Speak"))
             }
 
         case .copy:
@@ -4664,12 +4695,15 @@ struct ChatDetailView: View {
 
     private func toggleSpeech(for message: ChatMessage) {
         let tts = dependencies.textToSpeechService
+        if tts.readAloudPlayer.messageID == message.id {
+            tts.readAloudPlayer.togglePlayback()
+            return
+        }
         if speakingMessageId == message.id || ttsGeneratingMessageId == message.id {
             tts.stop()
             speakingMessageId = nil
             ttsGeneratingMessageId = nil
         } else {
-            tts.stop()
             speakingMessageId = nil
             ttsGeneratingMessageId = nil
             let rate = UserDefaults.standard.double(forKey: "ttsSpeechRate")
@@ -4693,7 +4727,10 @@ struct ChatDetailView: View {
             }()
             guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
             ttsGeneratingMessageId = message.id
-            tts.speak(content)
+            tts.speakMessage(content, messageID: message.id,
+                title: viewModel.conversation?.title ?? "Read Aloud",
+                serverSplitOn: dependencies.authViewModel.backendConfig?.audio?.tts?.splitOn)
+            if tts.readAloudPlayer.isVisible { ttsGeneratingMessageId = nil }
         }
     }
 
