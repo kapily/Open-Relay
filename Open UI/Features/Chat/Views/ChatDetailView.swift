@@ -498,8 +498,8 @@ struct ChatDetailView: View {
         // Confine the backdrop to the status-bar safe area, above the floating controls.
         .overlay {
             GeometryReader { geometry in
-                theme.background.opacity(0.8)
-                    .background(.ultraThinMaterial)
+                Rectangle()
+                    .fill(.ultraThinMaterial.opacity(0.5))
                     .mask(LinearGradient(stops: [
                         .init(color: .black, location: 0.45),
                         .init(color: .clear, location: 1)
