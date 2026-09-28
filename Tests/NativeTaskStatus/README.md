@@ -1,6 +1,6 @@
 # Native task status regression
 
-Baseline: Open Relay 5.9 (`f5b8ce8`), Open WebUI `8bd8b4f`.
+Baseline: Open Relay 6.0 (`4151a73`), Open WebUI `8bd8b4f`.
 
 Task rows cycled their status locally and silently posted to the nonexistent
 `/api/v1/tasks/{chat_id}/update` endpoint. The displayed change was not saved.
@@ -27,6 +27,12 @@ Python environment containing `aiohttp` and `python-socketio`. Connect Relay to
 Generate this directory's `project.yml` with XcodeGen. Run `testBefore` on the
 baseline app, or `testNativeTasks` on the fixed app. The tests inspect fixture
 state and unsupported-write counts as well as the actual task panel.
+
+The 6.0-based full Release build and 11 focused checks pass. The final simulator
+test passed three consecutive times. The fixture persists the completed node
+before emitting completion, matching the server. An earlier incomplete fixture
+only emitted completion; its immediate-clear check failed intermittently.
+The included before/after screenshots are from the 6.0-based simulator runs.
 
 All content is newly invented. This fixture does not import Open WebUI, use a real
 provider, or read private chats, settings, credentials, or logs.

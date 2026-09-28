@@ -13,12 +13,13 @@ INITIAL = [{"id": "paper", "content": "Fold paper", "status": "pending"}, {"id":
 CHAT = {}
 CHAT_ID = "synthetic-tasks"
 WRITES = []
+OBSERVATIONS = []
 ACTIVE = None
 
 def reset():
     global ACTIVE
     now = int(time.time())
-    CHAT.clear(); WRITES.clear(); ACTIVE = None
+    CHAT.clear(); WRITES.clear(); OBSERVATIONS.clear(); ACTIVE = None
     CHAT.update(id="synthetic-tasks", title="Synthetic task list", tasks=copy.deepcopy(INITIAL), models=[MODEL["id"]], history={"currentId": "assistant", "messages": {
         "user": {"id": "user", "role": "user", "content": "Plan a paper craft.", "parentId": None, "childrenIds": ["assistant"], "timestamp": now},
         "assistant": {"id": "assistant", "role": "assistant", "model": MODEL["id"], "content": "Two small craft tasks are ready.", "parentId": "user", "childrenIds": [], "done": True, "timestamp": now}
@@ -29,6 +30,7 @@ def envelope():
 
 async def tasks(updated):
     CHAT["tasks"] = updated
+    OBSERVATIONS.append({"event": copy.deepcopy(updated), "time": time.monotonic()})
     await sio.emit("events", {"chat_id": CHAT_ID, "message_id": CHAT["history"]["currentId"], "data": {"type": "chat:message:tasks", "data": {"tasks": updated}}})
 
 @sio.on("user-join")
@@ -41,10 +43,12 @@ async def handle(request):
     body = await request.json() if request.method == "POST" and request.can_read_body else {}
     result = []
     if path == "/_test/reset": reset(); result = {"ok": True}
-    elif path == "/_test/state": result = {"tasks": CHAT["tasks"], "writes": WRITES}
+    elif path == "/_test/state": result = {"tasks": CHAT["tasks"], "writes": WRITES, "observations": OBSERVATIONS}
     elif path == "/_test/tasks": await tasks(body["tasks"]); result = {"ok": True}
     elif path == "/_test/finish":
         if ACTIVE:
+            # Native completion persists the final node before emitting done.
+            CHAT["history"]["messages"][ACTIVE["id"]].update(content="Synthetic work finished.", done=True)
             await sio.emit("events", {"chat_id": CHAT_ID, "message_id": ACTIVE["id"], "session_id": ACTIVE["session_id"], "data": {"type": "chat:completion", "data": {"content": "Synthetic work finished.", "done": True}}})
             ACTIVE = None
         result = {"ok": True}
@@ -58,6 +62,7 @@ async def handle(request):
     elif path in ("/api/v1/chats", "/api/v1/chats/list"): result = [{k: v for k, v in envelope().items() if k != "chat"}]
     elif path == "/api/v1/chats/synthetic-tasks":
         if "chat" in body: CHAT.update(body["chat"])
+        OBSERVATIONS.append({"request": request.method, "tasks": copy.deepcopy(CHAT["tasks"]), "time": time.monotonic()})
         result = envelope()
     elif path == "/api/chat/completions":
         ACTIVE = body
