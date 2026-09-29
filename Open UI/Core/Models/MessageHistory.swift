@@ -18,6 +18,8 @@ nonisolated struct HistoryNode: Sendable {
     var content: String
     var timestamp: Date
     var model: String?
+    /// Native comparison column. Unlike a model ID, this distinguishes duplicate models.
+    var modelIndex: Int?
     var done: Bool
     var files: [ChatMessageFile]
     var sources: [ChatSourceReference]
@@ -55,6 +57,7 @@ nonisolated struct HistoryNode: Sendable {
         content: String = "",
         timestamp: Date = .now,
         model: String? = nil,
+        modelIndex: Int? = nil,
         done: Bool = true,
         files: [ChatMessageFile] = [],
         sources: [ChatSourceReference] = [],
@@ -77,6 +80,7 @@ nonisolated struct HistoryNode: Sendable {
         self.content = content
         self.timestamp = timestamp
         self.model = model
+        self.modelIndex = modelIndex
         self.done = done
         self.files = files
         self.sources = sources
@@ -108,7 +112,7 @@ nonisolated struct HistoryNode: Sendable {
 
         if role == .assistant {
             if let m = model { dict["model"] = m; dict["modelName"] = m }
-            dict["modelIdx"] = 0
+            if let modelIndex { dict["modelIdx"] = modelIndex }
             dict["done"] = done
         }
 
@@ -883,6 +887,7 @@ nonisolated struct MessageHistory: Sendable {
             content: content,
             timestamp: timestamp,
             model: model,
+            modelIndex: msg["modelIdx"] as? Int,
             done: done,
             files: files,
             sources: sources,

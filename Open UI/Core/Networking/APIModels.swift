@@ -264,6 +264,16 @@ struct BackendConfig: Codable, Sendable {
 
 /// Request body for `/api/chat/completions`.
 struct ChatCompletionRequest: Sendable {
+    struct ResponseTarget: Sendable, Equatable {
+        let modelID: String
+        let messageID: String
+        let modelIndex: Int
+
+        var serverDictionary: [String: Any] {
+            ["model_id": modelID, "message_id": messageID, "modelIdx": modelIndex]
+        }
+    }
+
     var model: String
     var messages: [[String: Any]]
     var stream: Bool = true
@@ -271,6 +281,8 @@ struct ChatCompletionRequest: Sendable {
     var sessionId: String?
     var messageId: String?
     var parentId: String?
+    /// One server request fans out to these ordered response columns.
+    var responseTargets: [ResponseTarget]?
     var skillIds: [String]?
     var toolIds: [String]?
     var filterIds: [String]?
@@ -347,6 +359,9 @@ struct ChatCompletionRequest: Sendable {
         if let messageId { data["id"] = messageId }
         if let chatId { data["chat_id"] = chatId }
         if let parentId { data["parent_id"] = parentId }
+        if let responseTargets, !responseTargets.isEmpty {
+            data["message_ids"] = responseTargets.map(\.serverDictionary)
+        }
         if let skillIds, !skillIds.isEmpty { data["skill_ids"] = skillIds }
         if let toolIds, !toolIds.isEmpty { data["tool_ids"] = toolIds }
         if let filterIds, !filterIds.isEmpty { data["filter_ids"] = filterIds }
