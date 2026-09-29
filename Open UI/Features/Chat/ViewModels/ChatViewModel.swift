@@ -41,6 +41,16 @@ final class ChatViewModel {
     /// This breaks the observation chain that was causing ALL messages
     /// to re-evaluate on every token.
     let streamingStore = StreamingContentStore()
+    private var responseGroup: ChatResponseGroup?
+
+    func streamingStore(for messageID: String) -> StreamingContentStore {
+        responseGroup?.stores[messageID] ?? streamingStore
+    }
+
+    private func isReceivingResponse(_ id: String) -> Bool {
+        if let group = responseGroup, group.stores[id] != nil { return group.isReceiving(id) }
+        return !hasFinishedStreaming
+    }
 
     var conversation: Conversation? {
         didSet {
@@ -1313,7 +1323,8 @@ final class ChatViewModel {
                 if let localNode = conversation?.history.nodes[id] {
                     // Node exists locally — update content fields but keep local
                     // content if we're actively streaming this message.
-                    let isActivelyStreaming = streamingStore.streamingMessageId == id && streamingStore.isActive
+                    let store = streamingStore(for: id)
+                    let isActivelyStreaming = store.streamingMessageId == id && store.isActive
                     if !isActivelyStreaming {
                         var updated = serverNode
                         // Preserve local childrenIds if they have more entries
@@ -1351,13 +1362,16 @@ final class ChatViewModel {
             // (e.g. when a background sub-agent appends new nodes after the
             // original assistant response). deepestLeaf() follows the last-child
             // chain to the tip of the active branch, matching WebUI's loadChat().
-            if !isStreaming, let serverCurrentId = serverConversation.history.currentId {
+            if !isStreaming, responseGroup == nil, let serverCurrentId = serverConversation.history.currentId {
                 let leaf = serverConversation.history.deepestLeaf(from: serverCurrentId)
                 conversation?.history.currentId = leaf
             }
         }
 
-        let serverMessages = serverConversation.messages
+        // The server's currentId may be whichever comparison finished last, not
+        // the branch the reader selected for the next prompt.
+        let serverMessages = responseGroup == nil ? serverConversation.messages
+            : conversation!.history.createMessagesList()
 
         // Build a set of server message IDs for removal detection
         let serverMessageIds = Set(serverMessages.map(\.id))
@@ -1385,8 +1399,8 @@ final class ChatViewModel {
                 // during active streaming. Letting adoptServerMessages() overwrite these
                 // fields would cause the "navigate away and back" bug where a second
                 // stale display path activates via message.isStreaming == true.
-                let isCurrentlyInPipeline = streamingStore.streamingMessageId == serverMsg.id
-                    && streamingStore.isActive
+                let store = streamingStore(for: serverMsg.id)
+                let isCurrentlyInPipeline = store.streamingMessageId == serverMsg.id && store.isActive
                 if isCurrentlyInPipeline { continue }
 
                 // GUARD: During active streaming, do NOT overwrite content of
@@ -1679,6 +1693,18 @@ final class ChatViewModel {
     private func startBackgroundCompletionPolling() {
         guard backgroundTaskId == .invalid else { return }
 
+        if let group = responseGroup, !group.finished, let chatId = conversationId ?? conversation?.id {
+            let socketSessionId = socketService?.sid ?? sessionId
+            backgroundTaskId = UIApplication.shared.beginBackgroundTask { [weak self, weak group] in
+                Task { @MainActor in
+                    guard let self, let group, self.responseGroup === group else { return }
+                    await self.recoverComparisonGroup(group, chatId: chatId, socketSessionId: socketSessionId)
+                    if self.responseGroup === group { self.endBackgroundTask() }
+                }
+            }
+            return
+        }
+
         let chatId = conversationId ?? conversation?.id
 
         backgroundTaskId = UIApplication.shared.beginBackgroundTask { [weak self] in
@@ -1773,6 +1799,11 @@ final class ChatViewModel {
     /// the server for the actual completion state and adopt it.
     private func recoverFromBackgroundStreaming() async {
         guard let chatId = conversationId ?? conversation?.id, let manager else { return }
+
+        if let group = responseGroup, !group.finished {
+            await recoverComparisonGroup(group, chatId: chatId, socketSessionId: socketService?.sid ?? sessionId)
+            return
+        }
 
         do {
             let serverConversation = try await manager.fetchConversation(id: chatId)
@@ -2443,6 +2474,9 @@ final class ChatViewModel {
         let payload = data["data"] as? [String: Any]
         let messageId = event["message_id"] as? String
         let chatId = conversationId ?? conversation?.id
+        // The active group subscription owns these responses, including late metadata.
+        // Do not start an unrelated single-response pipeline for a comparison peer.
+        if let messageId, responseGroup?.stores[messageId] != nil { return }
 
         // 🔍 DIAGNOSTIC: log every event arriving at the passive listener
         logger.info("👁️ [Passive] type=\(type ?? "nil", privacy: .public) msgId=\(messageId ?? "nil", privacy: .public) selfInitiated=\(self.selfInitiatedStream, privacy: .public) isStreaming=\(self.isStreaming, privacy: .public) isExternal=\(self.isExternallyStreaming, privacy: .public) isSyncing=\(self.isSyncingExternalStream, privacy: .public)")
@@ -3115,6 +3149,7 @@ final class ChatViewModel {
             inputText = ""
             return
         }
+        guard !isStreaming else { return }
 
         // A4: If any attachment is still uploading, queue the text and wait for all uploads
         // to complete before auto-sending. Clear the input field immediately so the user
@@ -3128,7 +3163,8 @@ final class ChatViewModel {
 
         guard let manager else { return }
         // Use mentioned model (@ override) if set, otherwise the chat's selected model
-        guard let modelId = mentionedModelId ?? selectedModelId else {
+        let modelIds = mentionedModelId.map { [$0] } ?? selectedModelIds
+        guard let modelId = modelIds.first, !modelId.isEmpty else {
             errorMessage = "Please select a model first."
             return
         }
@@ -3306,7 +3342,7 @@ final class ChatViewModel {
                 do {
                     let created = try await manager.createConversation(
                         title: chatTitle, messages: [], model: modelId,
-                        folderId: folderContextId)
+                        folderId: folderContextId, models: modelIds)
                     serverId = created.id
                 } catch {
                     logger.warning("Pre-create failed: \(error.localizedDescription)")
@@ -3315,7 +3351,7 @@ final class ChatViewModel {
             let localId = isTemporaryChat ? "local:\(UUID().uuidString)" : (serverId ?? UUID().uuidString)
             var newConv = Conversation(
                 id: localId,
-                title: chatTitle, model: modelId, messages: [userMessage])
+                title: chatTitle, models: modelIds, messages: [userMessage])
             // Apply any chat params that were set before the conversation existed
             if let pending = pendingChatParams {
                 newConv.chatParams = pending
@@ -3332,7 +3368,10 @@ final class ChatViewModel {
         chatFiles = AttachmentContext.adding(messageFiles, to: chatFiles)
 
         // Assistant placeholder
-        let assistantMessageId = UUID().uuidString
+        let responseTargets = modelIds.enumerated().map { index, model in
+            ChatCompletionRequest.ResponseTarget(modelID: model, messageID: UUID().uuidString, modelIndex: index)
+        }
+        let assistantMessageId = responseTargets[0].messageID
         conversation?.messages.append(ChatMessage(
             id: assistantMessageId, role: .assistant, content: "",
             timestamp: .now, model: modelId, isStreaming: true))
@@ -3342,29 +3381,24 @@ final class ChatViewModel {
         // childrenIds from the very first message, so that later calls to
         // editMessage() (which bootstraps the tree if empty) see a proper
         // branching structure instead of an orphaned root node.
-        let userNodeModels = [modelId]
+        let userNodeModels = modelIds
         let userHistoryNode = HistoryNode(
             id: userMessage.id,
             parentId: userMessageParentId,
-            childrenIds: [assistantMessageId],
+            childrenIds: responseTargets.map(\.messageID),
             role: .user,
             content: currentText,
             timestamp: userMessage.timestamp,
             files: messageFiles,
             models: userNodeModels
         )
-        let assistantHistoryNode = HistoryNode(
-            id: assistantMessageId,
-            parentId: userMessage.id,
-            childrenIds: [],
-            role: .assistant,
-            content: "",
-            timestamp: userMessage.timestamp,
-            model: modelId,
-            done: false
-        )
         conversation?.history.nodes[userMessage.id] = userHistoryNode
-        conversation?.history.nodes[assistantMessageId] = assistantHistoryNode
+        for target in responseTargets {
+            conversation?.history.nodes[target.messageID] = HistoryNode(
+                id: target.messageID, parentId: userMessage.id, role: .assistant,
+                timestamp: userMessage.timestamp, model: target.modelID,
+                modelIndex: modelIds.count > 1 ? target.modelIndex : nil, done: false)
+        }
         // Wire user node as a child of its parent (if parent exists in tree)
         if let pid = userMessageParentId {
             conversation?.history.appendChildId(userMessage.id, to: pid)
@@ -3387,7 +3421,6 @@ final class ChatViewModel {
         isStreaming = true
         hasFinishedStreaming = false
         selfInitiatedStream = true
-        streamingSessionId += 1
         // Clear the replay-block for the previous completed message — a new
         // stream is starting, so the old ID is no longer relevant and we don't
         // want to accidentally block events for future messages that might
@@ -3403,7 +3436,8 @@ final class ChatViewModel {
 
         // Activate the isolated streaming store so token updates bypass
         // conversation.messages and only invalidate the streaming message view.
-        streamingStore.beginStreaming(messageId: assistantMessageId, modelId: modelId)
+        prepareResponseStores(targets: responseTargets, comparison: responseTargets.count > 1)
+        let group = responseGroup
 
         // Ensure socket connected with resilient retry.
         // For Cloudflare-protected servers, WebSocket connections may be blocked
@@ -3448,7 +3482,7 @@ final class ChatViewModel {
             registerSocketHandlers(
                 socket: socket, assistantMessageId: assistantMessageId,
                 modelId: modelId, socketSessionId: socketSessionId,
-                effectiveChatId: effectiveChatId)
+                effectiveChatId: effectiveChatId, responseTargets: responseTargets)
         }
 
         // Sync conversation to server — this writes the complete message tree
@@ -3468,6 +3502,7 @@ final class ChatViewModel {
                     model: modelId, messages: apiMessages, stream: true,
                     chatId: effectiveChatId, sessionId: socketSessionId,
                     messageId: assistantMessageId, parentId: parentId)
+                if group != nil { request.responseTargets = responseTargets }
 
                 // Merge file attachment refs + knowledge item refs into request.files
                 var allFileRefs = fileRefs
@@ -3503,11 +3538,11 @@ final class ChatViewModel {
                 var userMsgDict: [String: Any] = [
                     "id": userMessage.id,
                     "parentId": (userMessageParentId as Any?) ?? NSNull(),
-                    "childrenIds": [assistantMessageId],
+                    "childrenIds": responseTargets.map(\.messageID),
                     "role": "user",
                     "content": currentText,
                     "timestamp": Int(userMessage.timestamp.timeIntervalSince1970),
-                    "models": [modelId]
+                    "models": modelIds
                 ]
                 if !currentMsgFileRefs.isEmpty { userMsgDict["files"] = currentMsgFileRefs }
                 request.userMessage = userMsgDict
@@ -3519,6 +3554,12 @@ final class ChatViewModel {
                 // Include skill IDs selected via the `$` picker.
                 // Sent as `skill_ids` in the top-level request body (separate from tool_ids).
                 if !currentSkillIds.isEmpty { request.skillIds = currentSkillIds }
+
+                if let group {
+                    await self.submitComparisonRequest(request, group: group, chatId: effectiveChatId,
+                                                       socketSessionId: socketSessionId)
+                    return
+                }
 
                 if capturedUseSSEFallback {
                     // ── HTTP + POLLING FALLBACK ──
@@ -3644,6 +3685,29 @@ final class ChatViewModel {
         streamingTask?.cancel()
         streamingTask = nil
 
+        if let group = responseGroup, !group.finished {
+            let taskIDs = group.taskIDs
+            let chatId = conversationId ?? conversation?.id
+            group.cancel()
+            for target in group.targets {
+                guard let store = group.stores[target.messageID], store.isActive else { continue }
+                let result = store.abortStreaming()
+                commitComparisonResponse(id: target.messageID, result: result, group: group)
+            }
+            finishComparisonGroupIfReady(group)
+            if let apiClient = manager?.apiClient {
+                Task {
+                    if taskIDs.isEmpty, let chatId {
+                        try? await apiClient.stopTasksByChatId(chatId: chatId)
+                    } else {
+                        for id in taskIDs { try? await apiClient.stopTask(taskId: id) }
+                    }
+                }
+            }
+            Task { await self.syncToServerViaTree() }
+            return
+        }
+
         // Stop the server-side task.
         // For self-initiated streams we already have the task_id from the HTTP POST response.
         // For externally-initiated streams (another device/browser) activeTaskId is nil,
@@ -3748,6 +3812,10 @@ final class ChatViewModel {
 
         let modelId = lastAssistant.model ?? selectedModelId ?? conversation?.model ?? ""
         guard let lastUser = conversation?.messages.last(where: { $0.role == .user }) else { return }
+        let column = conversation?.history.responseColumns(for: lastUser.id)
+            .first(where: { $0.messageIds.contains(assistantId) })
+        let target = ChatCompletionRequest.ResponseTarget(modelID: modelId, messageID: assistantId,
+                                                         modelIndex: column?.id ?? 0)
 
         let apiMessages = await buildAPIMessagesAsync()
         let parentId = lastUser.id
@@ -3773,11 +3841,10 @@ final class ChatViewModel {
 
         // Pre-seed the pipeline so the typewriter starts AFTER the existing content.
         // Only new tokens from the server will be revealed — old content is not re-streamed.
-        streamingStore.beginStreamingForContinue(
-            messageId: assistantId,
-            modelId: modelId,
-            existingContent: existingContent
-        )
+        prepareResponseStores(targets: [target],
+                              comparison: (conversation?.history.nodes[parentId]?.models.count ?? 0) > 1,
+                              prefixes: [assistantId: existingContent])
+        let group = responseGroup
 
         chatSubscription?.dispose()
         chatSubscription = nil
@@ -3811,7 +3878,7 @@ final class ChatViewModel {
             socket: socket, assistantMessageId: assistantId,
             modelId: modelId, socketSessionId: socketSessionId,
             effectiveChatId: effectiveChatId,
-            continuePrefix: existingContent)
+            continuePrefix: existingContent, responseTargets: group?.targets)
 
         streamingTask = Task { [weak self] in
             guard let self, let manager = self.manager else { return }
@@ -3823,6 +3890,7 @@ final class ChatViewModel {
 
                 // Tell the server to continue from the existing message content.
                 request.assistantMessageId = assistantId
+                request.responseTargets = group?.targets
 
                 // Build user_message node.
                 let userNodeParentId: String? = {
@@ -3838,12 +3906,17 @@ final class ChatViewModel {
                     "role": "user",
                     "content": lastUser.content,
                     "timestamp": Int(lastUser.timestamp.timeIntervalSince1970),
-                    "models": [modelId]
+                    "models": self.conversation?.history.nodes[parentId]?.models ?? [modelId]
                 ]
                 request.userMessage = userMsgDict
 
                 await self.populateCommonRequestFields(&request)
 
+                if let group {
+                    await self.submitComparisonRequest(request, group: group, chatId: effectiveChatId,
+                                                       socketSessionId: socketSessionId)
+                    return
+                }
                 let json = try await manager.sendMessageHTTP(request: request)
 
                 if let err = json["error"] as? String, !err.isEmpty {
@@ -3913,7 +3986,13 @@ final class ChatViewModel {
         // 3. Create a NEW assistant placeholder node (new UUID) as a sibling of the old one.
         //    Both are children of the same user node.
         let newAssistantId = UUID().uuidString
-        let modelId = selectedModelId ?? conversation?.model ?? ""
+        let isComparison = (conversation?.history.nodes[parentId]?.models.count ?? 0) > 1
+        let column = conversation?.history.responseColumns(for: parentId)
+            .first(where: { $0.messageIds.contains(messageId) })
+        let modelId = isComparison ? (oldNode.model ?? column?.modelId ?? "")
+            : (selectedModelId ?? conversation?.model ?? "")
+        let target = ChatCompletionRequest.ResponseTarget(modelID: modelId, messageID: newAssistantId,
+                                                         modelIndex: oldNode.modelIndex ?? column?.id ?? 0)
         let newAssistantNode = HistoryNode(
             id: newAssistantId,
             parentId: parentId,
@@ -3922,6 +4001,7 @@ final class ChatViewModel {
             content: "",
             timestamp: .now,
             model: modelId,
+            modelIndex: isComparison ? target.modelIndex : nil,
             done: false
         )
         conversation!.history.nodes[newAssistantId] = newAssistantNode
@@ -3968,7 +4048,8 @@ final class ChatViewModel {
         regenerateScrollToken = UUID()
 
         // Activate the isolated streaming store for the regenerated message
-        streamingStore.beginStreaming(messageId: newAssistantId, modelId: modelId)
+        prepareResponseStores(targets: [target], comparison: isComparison)
+        let group = responseGroup
 
         // Cancel any previous subscriptions/timers
         chatSubscription?.dispose()
@@ -4006,7 +4087,7 @@ final class ChatViewModel {
         registerSocketHandlers(
             socket: socket, assistantMessageId: newAssistantId,
             modelId: modelId, socketSessionId: socketSessionId,
-            effectiveChatId: effectiveChatId)
+            effectiveChatId: effectiveChatId, responseTargets: group?.targets)
 
         let capturedNewAssistantId = newAssistantId
         let capturedParentId = parentId
@@ -4019,6 +4100,7 @@ final class ChatViewModel {
                     model: modelId, messages: apiMessages, stream: true,
                     chatId: effectiveChatId, sessionId: socketSessionId,
                     messageId: capturedNewAssistantId, parentId: capturedParentId)
+                request.responseTargets = group?.targets
 
                 // Build the user_message node for the server's history tree.
                 // childrenIds = all children of the user node (includes old + new assistant).
@@ -4041,6 +4123,11 @@ final class ChatViewModel {
                 // Populate all common request fields
                 await self.populateCommonRequestFields(&request)
 
+                if let group {
+                    await self.submitComparisonRequest(request, group: group, chatId: effectiveChatId,
+                                                       socketSessionId: socketSessionId)
+                    return
+                }
                 let json = try await manager.sendMessageHTTP(request: request)
 
                 if let err = json["error"] as? String, !err.isEmpty {
@@ -4140,6 +4227,9 @@ final class ChatViewModel {
             conversation!.history = APIClient.buildHistoryFromFlatMessages(conversation!.messages)
         }
         guard let oldNode = conversation!.history.nodes[id], oldNode.role == .user else { return }
+        let modelIds = selectedModelIds.isEmpty
+            ? (oldNode.models.isEmpty ? conversation!.models : oldNode.models) : selectedModelIds
+        guard !modelIds.isEmpty else { return }
 
         // 2. The parent of the old user node (an assistant node, or nil for root).
         let parentId = oldNode.parentId
@@ -4157,7 +4247,7 @@ final class ChatViewModel {
             content: newContent,
             timestamp: .now,
             files: files ?? oldNode.files,
-            models: oldNode.models
+            models: modelIds
         )
 
         conversation!.history.nodes[newUserId] = newUserNode
@@ -4173,23 +4263,19 @@ final class ChatViewModel {
         // For root-level user edits (parentId == nil), both nodes are root siblings.
         // The server treats all null-parentId nodes as root siblings automatically.
 
-        // 5. Create a NEW assistant placeholder node.
-        let newAssistantId = UUID().uuidString
-        let assistantModel = selectedModelId ?? conversation?.model ?? ""
-        let newAssistantNode = HistoryNode(
-            id: newAssistantId,
-            parentId: newUserId,
-            childrenIds: [],
-            role: .assistant,
-            content: "",
-            timestamp: .now,
-            model: assistantModel,
-            done: false
-        )
-        conversation!.history.nodes[newAssistantId] = newAssistantNode
+        // 5. Create a new response for every selected model slot.
+        let targets = modelIds.enumerated().map { index, model in
+            ChatCompletionRequest.ResponseTarget(modelID: model, messageID: UUID().uuidString, modelIndex: index)
+        }
+        for target in targets {
+            conversation!.history.nodes[target.messageID] = HistoryNode(
+                id: target.messageID, parentId: newUserId, role: .assistant, model: target.modelID,
+                modelIndex: targets.count > 1 ? target.modelIndex : nil, done: false)
+        }
+        let newAssistantId = targets[0].messageID
 
         // 6. Wire the assistant as a child of the new user node.
-        conversation!.history.nodes[newUserId]!.childrenIds.append(newAssistantId)
+        conversation!.history.nodes[newUserId]!.childrenIds = targets.map(\.messageID)
 
         // 7. Update currentId to the new assistant (deepest leaf of the new branch).
         conversation!.history.currentId = newAssistantId
@@ -4205,7 +4291,7 @@ final class ChatViewModel {
         await syncToServerViaTree()
 
         // 10. Stream the AI response into the new assistant placeholder.
-        await regenerateIntoExistingMessage(assistantMessageId: newAssistantId)
+        await regenerateIntoExistingMessage(assistantMessageId: newAssistantId, responseTargets: targets)
     }
 
     /// Saves an edited assistant message content **in-place** — no new branch, no regeneration.
@@ -4439,11 +4525,13 @@ final class ChatViewModel {
 
     /// Regenerates content for an existing assistant message placeholder.
     /// Called after `editMessage()` when the assistant message already exists in the list.
-    private func regenerateIntoExistingMessage(assistantMessageId: String) async {
+    private func regenerateIntoExistingMessage(assistantMessageId: String,
+                                               responseTargets: [ChatCompletionRequest.ResponseTarget]? = nil) async {
         guard !isStreaming || isExternallyStreaming else { return }
         guard conversation?.messages.contains(where: { $0.id == assistantMessageId && $0.role == .assistant }) == true else { return }
 
-        let modelId = selectedModelId ?? conversation?.model ?? ""
+        let modelId = responseTargets?.first?.modelID ?? selectedModelId ?? conversation?.model ?? ""
+        let targets = responseTargets ?? [.init(modelID: modelId, messageID: assistantMessageId, modelIndex: 0)]
         guard let lastUser = conversation?.messages.last(where: { $0.role == .user }) else { return }
 
         let apiMessages = await buildAPIMessagesAsync()
@@ -4455,7 +4543,8 @@ final class ChatViewModel {
         selfInitiatedStream = true
         regenerateScrollToken = UUID()
 
-        streamingStore.beginStreaming(messageId: assistantMessageId, modelId: modelId)
+        prepareResponseStores(targets: targets, comparison: targets.count > 1)
+        let group = responseGroup
 
         // Mark the assistant message as streaming so the DRAIN-DEFERRAL system
         // works correctly. editMessage() creates the placeholder with the default
@@ -4473,16 +4562,18 @@ final class ChatViewModel {
         recoveryTimer = nil
 
         guard let socket = socketService else {
-            updateAssistantMessage(id: assistantMessageId, content: "No connection available.",
-                                   isStreaming: false, error: ChatMessageError(content: "No socket"))
+            for target in targets {
+                failResponse(id: target.messageID, content: "", error: ChatMessageError(content: "No connection available."))
+            }
             isStreaming = false
             return
         }
         if !socket.isConnected {
             let ok = await socket.ensureConnected(timeout: 10.0)
             if !ok {
-                updateAssistantMessage(id: assistantMessageId, content: "Unable to connect.",
-                    isStreaming: false, error: ChatMessageError(content: "Connection failed"))
+                for target in targets {
+                    failResponse(id: target.messageID, content: "", error: ChatMessageError(content: "Connection failed"))
+                }
                 isStreaming = false
                 return
             }
@@ -4498,7 +4589,7 @@ final class ChatViewModel {
         registerSocketHandlers(
             socket: socket, assistantMessageId: assistantMessageId,
             modelId: modelId, socketSessionId: socketSessionId,
-            effectiveChatId: effectiveChatId)
+            effectiveChatId: effectiveChatId, responseTargets: group?.targets)
 
         streamingTask = Task { [weak self] in
             guard let self, let manager = self.manager else { return }
@@ -4507,6 +4598,7 @@ final class ChatViewModel {
                     model: modelId, messages: apiMessages, stream: true,
                     chatId: effectiveChatId, sessionId: socketSessionId,
                     messageId: assistantMessageId, parentId: parentId)
+                request.responseTargets = group?.targets
 
                 // Build the user_message node for the server's history tree.
                 // For edit-regeneration, the user message already exists on the server.
@@ -4524,7 +4616,7 @@ final class ChatViewModel {
                     "role": "user",
                     "content": lastUser.content,
                     "timestamp": Int(lastUser.timestamp.timeIntervalSince1970),
-                    "models": [modelId]
+                    "models": self.conversation?.history.nodes[lastUser.id]?.models ?? [modelId]
                 ]
                 request.userMessage = editUserMsgDict
 
@@ -4536,6 +4628,11 @@ final class ChatViewModel {
                 // system variables, tool IDs, terminal, background tasks, etc.)
                 await self.populateCommonRequestFields(&request)
 
+                if let group {
+                    await self.submitComparisonRequest(request, group: group, chatId: effectiveChatId,
+                                                       socketSessionId: socketSessionId)
+                    return
+                }
                 let json = try await manager.sendMessageHTTP(request: request)
                 if let err = json["error"] as? String, !err.isEmpty {
                     self.updateAssistantMessage(id: assistantMessageId, content: "", isStreaming: false,
@@ -4655,11 +4752,12 @@ final class ChatViewModel {
             ?? [.init(modelID: modelId, messageID: assistantMessageId, modelIndex: 0)]
         var responseStreams: [String: (modelID: String, accumulator: ContentAccumulator)] = [:]
         for target in targets {
-            let acc = ContentAccumulator()
+            let acc = responseGroup?.accumulators[target.messageID] ?? ContentAccumulator()
             acc.onUpdate = { [weak self] content in
-                guard let self, !self.hasFinishedStreaming,
+                guard let self, self.isReceivingResponse(target.messageID),
                       self.streamingSessionId == updateSessionId else { return }
                 self.socketHasReceivedContent = true
+                self.responseGroup?.lastActivity[target.messageID] = Date()
                 self.updateAssistantMessage(id: target.messageID, content: content, isStreaming: true)
             }
             // Install the callback before seeding: an immediate delta can coalesce
@@ -4779,6 +4877,10 @@ final class ChatViewModel {
         let type = data["type"] as? String
         let payload = data["data"] as? [String: Any]
 
+        if responseGroup?.isReceiving(assistantMessageId) == true {
+            responseGroup?.lastActivity[assistantMessageId] = Date()
+        }
+
         // Title, tags, follow-ups, and sources can arrive AFTER done:true
         // so we must NOT guard on hasFinishedStreaming for those event types.
         // Only guard for content-producing events.
@@ -4893,7 +4995,7 @@ final class ChatViewModel {
         // --- Events that should only work during active streaming ---
 
         default:
-            guard !hasFinishedStreaming else { return }
+            guard isReceivingResponse(assistantMessageId) else { return }
 
             switch type {
             case "chat:completion":
@@ -4936,13 +5038,10 @@ final class ChatViewModel {
 
             case "chat:message:error":
                 let errContent = extractErrorContent(from: payload ?? data)
-                updateAssistantMessage(id: assistantMessageId, content: acc.content,
-                                        isStreaming: false, error: ChatMessageError(content: errContent))
-                cleanupStreaming()
+                failResponse(id: assistantMessageId, content: acc.content, error: ChatMessageError(content: errContent))
 
             case "chat:tasks:cancel":
-                updateAssistantMessage(id: assistantMessageId, content: acc.content, isStreaming: false)
-                cleanupStreaming()
+                failResponse(id: assistantMessageId, content: acc.content, error: nil)
 
             case "request:chat:completion":
                 if let ch = payload?["channel"] as? String, !ch.isEmpty {
@@ -5007,9 +5106,7 @@ final class ChatViewModel {
     ) {
         // ── Error check (fast-exit before any content processing) ─────────────
         if let err = payload["error"] as? String, !err.isEmpty {
-            updateAssistantMessage(id: assistantMessageId, content: acc.content,
-                                    isStreaming: false, error: ChatMessageError(content: err))
-            cleanupStreaming()
+            failResponse(id: assistantMessageId, content: acc.content, error: ChatMessageError(content: err))
             return
         }
 
@@ -5048,7 +5145,7 @@ final class ChatViewModel {
                 // streaming yet — we must wait for the user to answer (or time out).
                 // liveAskUserPrompt is cleared in answerAskUser/rejectAskUser, at which
                 // point the server resumes and will emit another done:true to finalize.
-                if liveAskUserPrompt != nil {
+                if let prompt = liveAskUserPrompt, prompt.messageId == assistantMessageId {
                     logger.info("done:true (output path) with ask_user pending — deferring finalization until user responds")
                     updateAssistantMessage(id: assistantMessageId, content: acc.content, isStreaming: true)
                     return
@@ -5128,7 +5225,7 @@ final class ChatViewModel {
         // Done signal for legacy paths
         if payload["done"] as? Bool == true {
             // Guard: if ask_user is pending, defer finalization (same as PATH 1).
-            if liveAskUserPrompt != nil {
+            if let prompt = liveAskUserPrompt, prompt.messageId == assistantMessageId {
                 logger.info("done:true (legacy path) with ask_user pending — deferring finalization until user responds")
                 return
             }
@@ -5171,7 +5268,7 @@ final class ChatViewModel {
         socketSessionId: String, effectiveChatId: String?,
         acc: ContentAccumulator
     ) {
-        guard !hasFinishedStreaming else { return }
+        guard isReceivingResponse(assistantMessageId) else { return }
 
         let innerType = innerPayload["type"] as? String ?? ""
 
@@ -5218,7 +5315,7 @@ final class ChatViewModel {
         assistantMessageId: String,
         acc: ContentAccumulator
     ) {
-        guard !hasFinishedStreaming else { return }
+        guard isReceivingResponse(assistantMessageId) else { return }
         let data = event["data"] as? [String: Any] ?? event
         let type = data["type"] as? String
         let payload = data["data"] as? [String: Any]
@@ -5231,6 +5328,193 @@ final class ChatViewModel {
 
     // MARK: - Streaming Completion
 
+    private func prepareResponseStores(targets: [ChatCompletionRequest.ResponseTarget], comparison: Bool,
+                                       prefixes: [String: String] = [:]) {
+        streamingSessionId += 1
+        if streamingStore.isActive, let id = streamingStore.streamingMessageId {
+            let result = streamingStore.abortStreaming()
+            updateAssistantMessage(id: id, content: result.content, isStreaming: false,
+                                   sources: result.sources, statusHistory: result.statusHistory, error: result.error)
+        }
+        if let previous = responseGroup {
+            previous.cancel()
+            for target in previous.targets where previous.stores[target.messageID]?.isActive == true {
+                if let result = previous.stores[target.messageID]?.abortStreaming() {
+                    commitComparisonResponse(id: target.messageID, result: result, group: previous)
+                }
+            }
+        }
+        responseGroup = comparison ? ChatResponseGroup(targets: targets, prefixes: prefixes) : nil
+        for target in targets {
+            conversation?.history.nodes[target.messageID]?.done = false
+            conversation?.history.nodes[target.messageID]?.error = nil
+        }
+        if !comparison, let target = targets.first {
+            streamingStore.beginStreamingForContinue(messageId: target.messageID, modelId: target.modelID,
+                                                      existingContent: prefixes[target.messageID] ?? "")
+        }
+    }
+
+    private func submitComparisonRequest(_ request: ChatCompletionRequest, group: ChatResponseGroup,
+                                         chatId: String?, socketSessionId: String) async {
+        guard responseGroup === group, !group.cancelled, let manager else { return }
+        do {
+            let response = try await manager.sendMessageHTTP(request: request)
+            let taskIDs = ChatResponseGroup.taskIDs(from: response)
+            guard self.manager === manager, responseGroup === group, !group.cancelled else {
+                // A Stop/new generation can race the HTTP reply. Stop only these tasks,
+                // never every task in a chat that might now have a newer generation.
+                for id in taskIDs { try? await manager.apiClient.stopTask(taskId: id) }
+                return
+            }
+            group.taskIDs = taskIDs
+            let hasError = [response["error"], response["detail"]].compactMap { $0 }.contains {
+                !($0 is NSNull) && ($0 as? String)?.isEmpty != true
+            }
+            if hasError, response["choices"] == nil {
+                let error = ChatMessageError(content: extractErrorContent(from: response))
+                for target in group.targets where group.isReceiving(target.messageID) {
+                    failResponse(id: target.messageID, content: group.accumulators[target.messageID]?.content ?? "", error: error)
+                }
+                return
+            }
+            if let chatId { startComparisonRecovery(group, chatId: chatId, socketSessionId: socketSessionId) }
+        } catch {
+            guard self.manager === manager, responseGroup === group, !group.cancelled else { return }
+            for target in group.targets where group.isReceiving(target.messageID) {
+                failResponse(id: target.messageID, content: group.accumulators[target.messageID]?.content ?? "",
+                             error: ChatMessageError(content: error.localizedDescription))
+            }
+        }
+    }
+
+    private func failResponse(id: String, content: String, error: ChatMessageError?) {
+        if responseGroup?.stores[id] != nil {
+            finishComparisonResponse(id: id, content: content, error: error, succeeded: false)
+        } else {
+            updateAssistantMessage(id: id, content: content, isStreaming: false, error: error)
+            cleanupStreaming()
+        }
+    }
+
+    private func finishComparisonResponse(
+        id: String, content: String, error: ChatMessageError? = nil, succeeded: Bool,
+        socketSessionId: String? = nil, chatId: String? = nil
+    ) {
+        guard let group = responseGroup, group.complete(id, succeeded: succeeded),
+              let store = group.stores[id] else { return }
+        if let error { store.setError(error) }
+        let result = store.endStreaming(finalContent: content)
+        commitComparisonResponse(id: id, result: result, group: group)
+
+        if succeeded, let chatId, let socketSessionId,
+           let target = group.targets.first(where: { $0.messageID == id }), let manager {
+            let messages = buildSimpleAPIMessages(endingAt: id)
+            group.completionTasks.append(Task { [weak self, weak group] in
+                guard let self, let group, self.responseGroup === group, !group.cancelled else { return }
+                await manager.sendChatCompleted(chatId: chatId, messageId: id, model: target.modelID,
+                                                sessionId: socketSessionId, messages: messages)
+                guard !Task.isCancelled, self.responseGroup === group else { return }
+                try? await self.refreshConversationMetadata(chatId: chatId, assistantMessageId: id)
+            })
+        }
+        finishComparisonGroupIfReady(group)
+    }
+
+    private func commitComparisonResponse(id: String, result: StreamingContentStore.StreamingResult, group: ChatResponseGroup) {
+        conversation?.history.updateNode(id: id) { node in
+            node.content = result.content
+            node.done = true
+            node.output = group.accumulators[id]?.rawOutput ?? []
+            if !result.sources.isEmpty { node.sources = result.sources }
+            node.statusHistory = result.statusHistory.map { status in
+                var completed = status
+                completed.done = true
+                return completed
+            }
+            node.error = result.error
+        }
+        if let index = conversation?.messages.firstIndex(where: { $0.id == id }),
+           var message = conversation?.history.message(id: id) {
+            message.isStreaming = false
+            conversation?.messages[index] = message
+        }
+    }
+
+    private func finishComparisonGroupIfReady(_ group: ChatResponseGroup) {
+        guard responseGroup === group, group.pending.isEmpty, !group.finished else { return }
+        group.finished = true
+        group.recoveryTask?.cancel()
+        group.recoveryTask = nil
+        stopSwitchStatusPolling()
+        isStreaming = false
+        hasFinishedStreaming = true
+        selfInitiatedStream = false
+        startPassiveSocketListener()
+        // Keep the subscription for follow-ups and metadata until the next generation.
+        // A comparison produces one ready notification, only after all columns finish.
+        group.completionTasks.append(Task { [weak self, weak group] in
+            guard let self, let group, self.responseGroup === group else { return }
+            if !group.cancelled, let id = group.targets.first(where: { group.successful.contains($0.messageID) })?.messageID,
+               let content = self.conversation?.history.nodes[id]?.content {
+                await self.sendCompletionNotificationIfNeeded(content: content)
+            }
+            guard self.responseGroup === group else { return }
+            self.endBackgroundTask()
+            NotificationCenter.default.post(name: .conversationListNeedsRefresh, object: nil)
+        })
+        if !messageQueue.isEmpty {
+            let combined = messageQueue.map(\.text).joined(separator: "\n\n")
+            messageQueue.removeAll()
+            Task { [weak self, weak group] in
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                guard let self, let group, self.responseGroup === group else { return }
+                await self.sendMessage(directText: combined)
+            }
+        }
+    }
+
+    private func recoverComparisonGroup(_ group: ChatResponseGroup, chatId: String, socketSessionId: String) async {
+        guard responseGroup === group, !group.cancelled, !group.pending.isEmpty, let manager else { return }
+        let started = Date()
+        guard let fetched = try? await manager.fetchConversation(id: chatId),
+              self.manager === manager, responseGroup === group, !group.cancelled else { return }
+        for target in group.targets where group.isReceiving(target.messageID) {
+            let id = target.messageID
+            // A fetch begun before a newer live event must not replace it.
+            guard (group.lastActivity[id] ?? .distantPast) <= started,
+                  let node = fetched.history.nodes[id] else { continue }
+            if let output = node.output.isEmpty ? nil : node.output {
+                group.accumulators[id]?.replaceOutput(output)
+            } else if !node.content.isEmpty {
+                group.accumulators[id]?.replace(node.content)
+            }
+            if !node.sources.isEmpty { appendSources(id: id, sources: node.sources) }
+            for status in node.statusHistory { appendStatusUpdate(id: id, status: status) }
+            guard node.done else { continue }
+            // Pending human/tool input is not completion of the response.
+            guard MessageHistory.findPendingAskUser(messageId: id, in: node.output) == nil,
+                  MessageHistory.findPendingApprovalCall(messageId: id, in: node.output) == nil,
+                  !(node.content.contains("tool_calls") && node.content.contains("done=\"false\"")) else { continue }
+            finishComparisonResponse(id: id, content: group.accumulators[id]?.content ?? node.content, error: node.error,
+                                     succeeded: node.error == nil, socketSessionId: socketSessionId, chatId: chatId)
+        }
+    }
+
+    private func startComparisonRecovery(_ group: ChatResponseGroup, chatId: String, socketSessionId: String) {
+        group.recoveryTask?.cancel()
+        group.recoveryTask = Task { [weak self, weak group] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled, let self, let group,
+                      self.responseGroup === group, !group.cancelled, !group.pending.isEmpty else { return }
+                if group.pending.contains(where: { Date().timeIntervalSince(group.lastActivity[$0] ?? .distantPast) >= 5 }) {
+                    await self.recoverComparisonGroup(group, chatId: chatId, socketSessionId: socketSessionId)
+                }
+            }
+        }
+    }
+
     private func finishStreamingSuccessfully(
         assistantMessageId: String,
         modelId: String,
@@ -5238,6 +5522,11 @@ final class ChatViewModel {
         effectiveChatId: String?,
         acc: ContentAccumulator
     ) {
+        if responseGroup?.stores[assistantMessageId] != nil {
+            finishComparisonResponse(id: assistantMessageId, content: acc.content, succeeded: true,
+                                     socketSessionId: socketSessionId, chatId: effectiveChatId)
+            return
+        }
         // If content is empty, poll server for it
         if acc.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             Task {
@@ -5823,6 +6112,8 @@ final class ChatViewModel {
     }
 
     private func cleanupStreaming() {
+        // Group members complete independently through finishComparisonResponse.
+        if let group = responseGroup, !group.finished { return }
         guard !hasFinishedStreaming else { return }
         stopSwitchStatusPolling()
         hasFinishedStreaming = true
@@ -6499,7 +6790,9 @@ final class ChatViewModel {
     private func populateCommonRequestFields(_ request: inout ChatCompletionRequest) async {
         // Refresh model metadata to pick up live admin changes
         await refreshSelectedModelMetadata()
-        if var mi = selectedModel?.rawModelItem {
+        let requestModel = availableModels.first { $0.id == request.model }
+        let usesNativeTargets = request.responseTargets != nil
+        if var mi = requestModel?.rawModelItem {
             // Ensure owned_by and object are non-null strings for pipe model routing.
             // The single-model endpoint omits these fields; without them the server's
             // Python pipe code does `owned_by.startswith(...)` on None and crashes.
@@ -6520,14 +6813,16 @@ final class ChatViewModel {
             }
             request.modelItem = mi
         } else {
-            if self.selectedModel?.isPipeModel == true {
-                self.logger.warning("[pipe] rawModelItem is nil for pipe model '\(self.selectedModel?.id ?? "?")' — model_item will be omitted from request")
+            if requestModel?.isPipeModel == true {
+                self.logger.warning("[pipe] rawModelItem is nil for pipe model '\(requestModel?.id ?? "?")' — model_item will be omitted from request")
             }
             request.modelItem = nil
         }
 
         // Filter IDs from model's server-configured filter list
-        let filterIds = selectedModel?.filterIds ?? []
+        // Native fan-out resolves workspace defaults independently for each model.
+        // Sending the primary model's defaults here would also apply them to peers.
+        let filterIds = usesNativeTargets ? [] : (requestModel?.filterIds ?? [])
         if !filterIds.isEmpty { request.filterIds = filterIds }
 
         // Always send the full features object with explicit true/false values
@@ -6557,7 +6852,8 @@ final class ChatViewModel {
             // prompt in OpenWebUI, the app picks up the fresh value on the next
             // send — even for existing chats where chatParams was set at creation
             // time and never re-read from the server.
-            if let info = selectedModel?.rawModelItem?["info"] as? [String: Any],
+            if !usesNativeTargets,
+               let info = requestModel?.rawModelItem?["info"] as? [String: Any],
                let mParams = info["params"] as? [String: Any],
                let sp = mParams["system"] as? String,
                !sp.trimmingCharacters(in: .whitespaces).isEmpty { return sp }
@@ -6566,7 +6862,7 @@ final class ChatViewModel {
         if let sp = effectiveSP, !sp.trimmingCharacters(in: .whitespaces).isEmpty {
             params["system"] = sp
         }
-        if let fc = selectedModel?.functionCallingMode, fc == "native" {
+        if !usesNativeTargets, let fc = requestModel?.functionCallingMode, fc == "native" {
             params["function_calling"] = "native"
         }
         // Inject tool_approval_mode when the server has HITL permissions enabled.
@@ -6703,7 +6999,7 @@ final class ChatViewModel {
     /// conversation without fetching image data from the server.
     /// Used for `/api/chat/completed` so filter outlets receive the full
     /// conversation history and can run their post-processing logic.
-    private func buildSimpleAPIMessages() -> [[String: Any]] {
+    private func buildSimpleAPIMessages(endingAt messageId: String? = nil) -> [[String: Any]] {
         guard let conversation else { return [] }
         var msgs: [[String: Any]] = []
         let simpleEffectiveSP: String? = {
@@ -6716,7 +7012,10 @@ final class ChatViewModel {
         if let sp = simpleEffectiveSP, !sp.trimmingCharacters(in: .whitespaces).isEmpty {
             msgs.append(["role": "system", "content": sp])
         }
-        for msg in conversation.messages where !msg.isStreaming {
+        var history = conversation.history
+        if let messageId { history.currentId = messageId }
+        let branch = messageId == nil ? conversation.messages : history.createMessagesList()
+        for msg in branch where !msg.isStreaming {
             msgs.append(["role": msg.role.rawValue, "content": msg.content])
         }
         return msgs
@@ -7134,6 +7433,18 @@ final class ChatViewModel {
         statusHistory: [ChatStatusUpdate]? = nil,
         error: ChatMessageError? = nil
     ) {
+        if let group = responseGroup, let store = group.stores[id] {
+            guard group.isReceiving(id) else { return }
+            if isStreaming {
+                store.updateContent(content)
+                if let sources { store.appendSources(sources) }
+                for status in statusHistory ?? [] { store.appendStatus(status) }
+                if let error { store.setError(error) }
+            } else {
+                finishComparisonResponse(id: id, content: content, error: error, succeeded: false)
+            }
+            return
+        }
         if isStreaming && streamingStore.streamingMessageId == id {
             // ── STREAMING PATH ──
             // Route content to the isolated StreamingContentStore.
@@ -7266,8 +7577,9 @@ final class ChatViewModel {
         // Also write to the streaming store so the isolated streaming status
         // view sees the update in real-time (it reads from streamingStore,
         // not conversation.messages, during active streaming).
-        if streamingStore.streamingMessageId == id && streamingStore.isActive {
-            streamingStore.appendStatus(status)
+        let store = streamingStore(for: id)
+        if store.streamingMessageId == id && store.isActive {
+            store.appendStatus(status)
         }
     }
 
@@ -7449,8 +7761,9 @@ final class ChatViewModel {
         // Mirror into streamingStore so IsolatedAssistantMessage has sources
         // both during streaming AND in the post-stream handoff window before
         // the final message commit propagates back through the view hierarchy.
-        if streamingStore.streamingMessageId == id {
-            streamingStore.appendSources(sources)
+        let store = streamingStore(for: id)
+        if store.streamingMessageId == id {
+            store.appendSources(sources)
         }
     }
 
@@ -7937,6 +8250,7 @@ final class ContentAccumulator: @unchecked Sendable {
     private nonisolated(unsafe) var output: [[String: Any]]?
     private nonisolated(unsafe) var outputPrefix = ""
     private nonisolated(unsafe) var outputDirty = false
+    private nonisolated(unsafe) var finished = false
     private nonisolated(unsafe) var _onUpdate: (@MainActor @Sendable (_ content: String) -> Void)?
 
     /// Guards against flooding the main actor with redundant Tasks.
@@ -7965,6 +8279,19 @@ final class ContentAccumulator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return currentContent()
+    }
+
+    nonisolated var rawOutput: [[String: Any]]? {
+        lock.lock()
+        defer { lock.unlock() }
+        // A legacy continuation prefix cannot be represented by the new items alone.
+        return outputPrefix.isEmpty ? output : nil
+    }
+
+    nonisolated func finish() {
+        lock.lock()
+        finished = true
+        lock.unlock()
     }
 
     /// Called under the lock. `mutate` normally rebuilds structured content on the
@@ -8062,6 +8389,7 @@ final class ContentAccumulator: @unchecked Sendable {
 
     nonisolated private func mutate(_ change: () -> Void) {
         lock.lock()
+        guard !finished else { lock.unlock(); return }
         change()
         // Structured (output-array) replies are rebuilt HERE, on the socket's
         // background thread, not when the main actor collects the update. The

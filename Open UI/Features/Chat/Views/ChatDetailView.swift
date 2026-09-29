@@ -2704,10 +2704,10 @@ struct ChatDetailView: View {
                 // instance receives it as a plain Bool. Non-active instances never read
                 // any streamingStore properties in their body, making them completely
                 // inert during token delivery.
-                let isActiveStatus = viewModel.streamingStore.streamingMessageId == message.id
-                    && viewModel.streamingStore.isActive
+                let store = viewModel.streamingStore(for: message.id)
+                let isActiveStatus = store.streamingMessageId == message.id && store.isActive
                 IsolatedStreamingStatus(
-                    streamingStore: viewModel.streamingStore,
+                    streamingStore: store,
                     message: message,
                     isActiveStore: isActiveStatus
                 )
@@ -2977,7 +2977,7 @@ struct ChatDetailView: View {
             // on every token. ChatDetailView.body never touches these properties,
             // so it stays completely inert during streaming.
             IsolatedAssistantMessage(
-                streamingStore: viewModel.streamingStore,
+                streamingStore: viewModel.streamingStore(for: message.id),
                 message: message,
                 activeVersionIndex: activeVersionIndex[message.id] ?? -1,
                 contentOverride: assistantContentOverride[message.id],

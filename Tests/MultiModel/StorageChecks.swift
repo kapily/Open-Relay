@@ -54,6 +54,7 @@ final class MetadataHarness {
     var conversationId: String?
     var manager: ConversationManager?
     let streamingStore = FixtureStream()
+    func streamingStore(for id: String) -> FixtureStream { streamingStore }
     var streamingSessionId = 0
     var tasks: [ChatTask] = []
     init(_ conversation: Conversation, manager: ConversationManager) {

@@ -22,6 +22,9 @@ final class SocketIOService {
         return SocketSubscription()
     }
 }
+@MainActor final class StreamingContentStore {
+    func beginStreamingForContinue(messageId: String, modelId: String?, existingContent: String) {}
+}
 @MainActor final class RoutingHarness {
     struct Terminal { let id: String }
     var chatSubscription: SocketSubscription?
@@ -30,6 +33,8 @@ final class SocketIOService {
     var selectedTerminalServer: Terminal?
     var streamingSessionId = 1
     var hasFinishedStreaming = false
+    var responseGroup: ChatResponseGroup?
+    // RECEIVING
     var socketHasReceivedContent = false
     var content: [String: String] = [:]
     var handled: [(String, String)] = []
