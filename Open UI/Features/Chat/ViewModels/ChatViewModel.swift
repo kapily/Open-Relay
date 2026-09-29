@@ -74,7 +74,11 @@ final class ChatViewModel {
             }
         }
     }
-    var selectedModelId: String?
+    var selectedModelIds: [String] = []
+    var selectedModelId: String? {
+        get { selectedModelIds.first }
+        set { selectedModelIds = newValue.map { [$0] } ?? [] }
+    }
     var isStreaming: Bool = false {
         didSet {
             // Update the store's streamingConversationId so the sidebar spinner
@@ -518,7 +522,8 @@ final class ChatViewModel {
             // Tree not populated — fall back to flat-list sync
             try? await manager.syncConversationMessages(
                 id: chatId, messages: conversation?.messages ?? [], model: modelId,
-                title: conversation?.title, chatParams: conversation?.chatParams, chatFiles: chatFiles)
+                title: conversation?.title, chatParams: conversation?.chatParams, chatFiles: chatFiles,
+                models: selectedModelIds.isEmpty ? conversation?.models : selectedModelIds)
             return
         }
 
@@ -529,7 +534,8 @@ final class ChatViewModel {
             systemPrompt: conv.systemPrompt,
             chatParams: conv.chatParams,
             title: conv.title,
-            chatFiles: chatFiles
+            chatFiles: chatFiles,
+            models: selectedModelIds.isEmpty ? conv.models : selectedModelIds
         )
     }
 
@@ -1099,20 +1105,7 @@ final class ChatViewModel {
             // Populate top-level chat files (mirrors OWUI `chatFiles = chat?.files ?? []`)
             chatFiles = fetched.files
             backfillLegacyChatContextIfNeeded()
-            // Always adopt the last-used model for existing chats.
-            // Priority: last assistant message's model (the actual model used
-            // most recently) > conversation-level model > fallback.
-            // This ensures returning to a chat uses the model from the most
-            // recent response, even if it was changed mid-conversation from
-            // the web UI or another client.
-            if let lastAssistantModel = fetched.messages.last(where: { $0.role == .assistant })?.model,
-               !lastAssistantModel.isEmpty {
-                selectedModelId = lastAssistantModel
-            } else if let conversationModel = fetched.model, !conversationModel.isEmpty {
-                selectedModelId = conversationModel
-            } else if selectedModelId == nil {
-                selectedModelId = availableModels.first?.id
-            }
+            restoreModelSelection(from: fetched)
         } catch {
             // When offline, try to serve the conversation from the on-disk cache so
             // previously-opened chats remain readable without a connection.
@@ -1124,15 +1117,7 @@ final class ChatViewModel {
                 deletedMessageIds = []
                 tasks = cached.conversation.tasks
                 chatFiles = cached.conversation.files
-                // Restore model selection from cached data
-                if let lastAssistantModel = cached.conversation.messages.last(where: { $0.role == .assistant })?.model,
-                   !lastAssistantModel.isEmpty {
-                    selectedModelId = lastAssistantModel
-                } else if let conversationModel = cached.conversation.model, !conversationModel.isEmpty {
-                    selectedModelId = conversationModel
-                } else if selectedModelId == nil {
-                    selectedModelId = availableModels.first?.id
-                }
+                restoreModelSelection(from: cached.conversation)
             } else {
                 logger.error("Failed to load conversation: \(error.localizedDescription)")
                 errorMessage = error.localizedDescription
@@ -1317,9 +1302,7 @@ final class ChatViewModel {
         guard conversation != nil else {
             // No local conversation yet — just assign directly
             conversation = serverConversation
-            if let serverModel = serverConversation.model, selectedModelId != serverModel {
-                selectedModelId = serverModel
-            }
+            restoreModelSelection(from: serverConversation)
             return
         }
 
@@ -3100,7 +3083,8 @@ final class ChatViewModel {
                 messages: conversation.messages,
                 chatParams: conversation.chatParams,
                 folderId: folderContextId,
-                chatFiles: conversation.files
+                chatFiles: conversation.files,
+                models: selectedModelIds.isEmpty ? conversation.models : selectedModelIds
             )
             // Swap the local ID for the server-assigned one — in-place, no reload.
             self.conversation?.id = created.id
@@ -4090,13 +4074,18 @@ final class ChatViewModel {
     }
 
     func selectModel(_ modelId: String) {
-        selectedModelId = modelId
+        selectModels([modelId])
+    }
+
+    func selectModels(_ modelIds: [String]) {
+        guard !modelIds.isEmpty else { return }
+        selectedModelIds = modelIds
         // Switching models is a deliberate user action — reset disabled tools
         // so the new model's defaults apply cleanly without stale overrides.
         userDisabledToolIds = []
         userDisabledBuiltinFeatures = []
         syncUIWithModelDefaults()
-        conversation?.model = modelId
+        conversation?.models = modelIds
         // Fetch full model config from single-model endpoint to get params.function_calling,
         // toolIds, defaultFeatureIds, and capabilities — which /api/models doesn't return.
         // Store the task so sendMessage/regenerate can await it if the user sends
@@ -4104,6 +4093,19 @@ final class ChatViewModel {
         modelConfigTask?.cancel()
         modelConfigTask = Task { [weak self] in
             await self?.refreshSelectedModelConfig()
+        }
+    }
+
+    private func restoreModelSelection(from conversation: Conversation) {
+        if conversation.models.count > 1 {
+            selectedModelIds = conversation.models
+        } else if let model = conversation.messages.last(where: { $0.role == .assistant })?.model,
+                  !model.isEmpty {
+            selectedModelId = model
+        } else if let model = conversation.model, !model.isEmpty {
+            selectedModelId = model
+        } else if selectedModelId == nil {
+            selectedModelId = availableModels.first?.id
         }
     }
 
@@ -4245,6 +4247,8 @@ final class ChatViewModel {
         if conversation!.history.nodes[id] != nil {
             conversation!.history.nodes[id]!.content = newContent
             conversation!.history.nodes[id]!.done = true
+            // The text editor replaces this response, not its peers' structured output.
+            conversation!.history.nodes[id]!.output = []
         }
 
         // 3. Persist the full chat to the server.
@@ -4428,7 +4432,8 @@ final class ChatViewModel {
             systemPrompt: conv.systemPrompt,
             chatParams: conv.chatParams,
             title: conv.title,
-            chatFiles: conv.files
+            chatFiles: conv.files,
+            models: selectedModelIds.isEmpty ? conv.models : selectedModelIds
         )
     }
 
@@ -4639,43 +4644,46 @@ final class ChatViewModel {
         modelId: String,
         socketSessionId: String,
         effectiveChatId: String?,
-        continuePrefix: String? = nil
+        continuePrefix: String? = nil,
+        responseTargets: [ChatCompletionRequest.ResponseTarget]? = nil
     ) {
         chatSubscription?.dispose()
         channelSubscription?.dispose()
-        let acc = ContentAccumulator()
-
-        // For continue responses: pre-seed the accumulator with the existing message
-        // content so that delta tokens are appended to the correct base.
-        // Without this, chat:message:delta events call acc.append(newToken) giving
-        // acc.content = "" + newToken (tiny). When pipeline.append(tinyString) is
-        // called, buffer = tinyString but displayedCount = existingContent.count (large),
-        // so currentBuffered < 0 — nothing drains and the continuation is invisible.
-        if let prefix = continuePrefix, !prefix.isEmpty {
-            acc.replace(prefix)
-        }
-
-        // Wire up the immediate UI update callback.
-        // The accumulator coalesces concurrent token arrivals into a single
-        // pending MainActor Task — preventing main actor flooding while still
-        // delivering each token as fast as Swift's task scheduler allows.
-        let msgId = assistantMessageId
         let updateSessionId = streamingSessionId
         let terminalServerId = terminalEnabled ? selectedTerminalServer?.id : nil
-        acc.onUpdate = { [weak self] content in
-            // Guard: if streaming already finished (done:true processed),
-            // ignore late-arriving accumulated content dispatches.
-            guard let self, !self.hasFinishedStreaming,
-                  self.streamingSessionId == updateSessionId else { return }
-            self.socketHasReceivedContent = true
-            self.updateAssistantMessage(id: msgId, content: content, isStreaming: true)
+        let targets = responseTargets.flatMap { $0.isEmpty ? nil : $0 }
+            ?? [.init(modelID: modelId, messageID: assistantMessageId, modelIndex: 0)]
+        var responseStreams: [String: (modelID: String, accumulator: ContentAccumulator)] = [:]
+        for target in targets {
+            let acc = ContentAccumulator()
+            acc.onUpdate = { [weak self] content in
+                guard let self, !self.hasFinishedStreaming,
+                      self.streamingSessionId == updateSessionId else { return }
+                self.socketHasReceivedContent = true
+                self.updateAssistantMessage(id: target.messageID, content: content, isStreaming: true)
+            }
+            // Install the callback before seeding: an immediate delta can coalesce
+            // with this update, so the first queued delivery must have a recipient.
+            if target.messageID == assistantMessageId, let prefix = continuePrefix, !prefix.isEmpty {
+                acc.replace(prefix)
+            }
+            responseStreams[target.messageID] = (target.modelID, acc)
         }
+        let streams = responseStreams
 
         chatSubscription = socket.addChatEventHandler(
             conversationId: effectiveChatId,
             sessionId: socketSessionId
         ) { [weak self] event, ack in
             guard let self else { return }
+            // A chat subscription receives every comparison response. Route before
+            // touching an accumulator; model ID alone cannot distinguish duplicates.
+            guard let responseID = event["message_id"] as? String
+                    ?? (streams.count == 1 ? assistantMessageId : nil),
+                  let response = streams[responseID] else { return }
+            let assistantMessageId = responseID
+            let modelId = response.modelID
+            let acc = response.accumulator
             // Fast-path: check if this is a content delta we can handle
             // entirely through the throttled accumulator WITHOUT scheduling
             // a @MainActor task per token.
@@ -4707,6 +4715,7 @@ final class ChatViewModel {
             }
             // For all other event types, dispatch to main actor normally
             Task { @MainActor in
+                guard self.streamingSessionId == updateSessionId else { return }
                 if type == "terminal:display_file" {
                     self.receiveTerminalFile(data["data"] as? [String: Any], messageId: assistantMessageId,
                                              chatId: effectiveChatId, serverId: terminalServerId)
@@ -4724,6 +4733,11 @@ final class ChatViewModel {
             sessionId: socketSessionId
         ) { [weak self] event, _ in
             guard let self else { return }
+            guard let responseID = event["message_id"] as? String
+                    ?? (streams.count == 1 ? assistantMessageId : nil),
+                  let response = streams[responseID] else { return }
+            let assistantMessageId = responseID
+            let acc = response.accumulator
             // Fast-path for channel content deltas
             let data = event["data"] as? [String: Any] ?? event
             let type = data["type"] as? String
@@ -4733,6 +4747,7 @@ final class ChatViewModel {
                 return
             }
             Task { @MainActor in
+                guard self.streamingSessionId == updateSessionId else { return }
                 self.handleChannelEvent(event, assistantMessageId: assistantMessageId, acc: acc)
             }
         }
@@ -7228,22 +7243,25 @@ final class ChatViewModel {
     }
 
     private func appendStatusUpdate(id: String, status: ChatStatusUpdate) {
-        guard let index = conversation?.messages.firstIndex(where: { $0.id == id }) else { return }
+        let index = conversation?.messages.firstIndex(where: { $0.id == id })
+        guard index != nil || conversation?.history.nodes[id] != nil else { return }
+        var statuses = index.flatMap { conversation?.messages[$0].statusHistory }
+            ?? conversation?.history.nodes[id]?.statusHistory ?? []
 
         // Deduplicate: update existing in-progress status with same action
-        if let existingIdx = conversation?.messages[index].statusHistory.firstIndex(
+        if let existingIdx = statuses.firstIndex(
             where: { $0.action == status.action && $0.done != true }
         ) {
-            conversation?.messages[index].statusHistory[existingIdx] = status
+            statuses[existingIdx] = status
         } else {
             // Don't add duplicate done statuses with the same action
-            let isDuplicate = conversation?.messages[index].statusHistory.contains(where: {
+            let isDuplicate = statuses.contains(where: {
                 $0.action == status.action && $0.done == true && status.done == true
-            }) ?? false
-            if !isDuplicate {
-                conversation?.messages[index].statusHistory.append(status)
-            }
+            })
+            if !isDuplicate { statuses.append(status) }
         }
+        conversation?.history.nodes[id]?.statusHistory = statuses
+        if let index { conversation?.messages[index].statusHistory = statuses }
 
         // Also write to the streaming store so the isolated streaming status
         // view sees the update in real-time (it reads from streamingStore,
@@ -7281,7 +7299,7 @@ final class ChatViewModel {
         // are correctly populated after a version switch (which calls rederiveMessages()
         // and makes the sibling the main message). Without this, switching from
         // version 2 → version 1 shows no follow-ups until the conversation is reloaded.
-        if let siblingIds = conversation?.history.siblings(of: id) {
+        if let siblingIds = conversation?.history.versionSiblings(of: id) {
             for sibId in siblingIds where sibId != id {
                 // Only copy if the sibling doesn't already have its own follow-ups.
                 let sibHasFollowUps = (conversation?.history.nodes[sibId]?.followUps.isEmpty == false)
@@ -7297,7 +7315,12 @@ final class ChatViewModel {
     /// Refreshes conversation metadata (title, sources, follow-ups, files) from server.
     private func refreshConversationMetadata(chatId: String, assistantMessageId: String) async throws {
         guard let manager else { return }
+        let session = streamingSessionId
+        let originalContent = conversation?.history.nodes[assistantMessageId]?.content
+            ?? conversation?.messages.first(where: { $0.id == assistantMessageId })?.content
         let refreshed = try await manager.fetchConversation(id: chatId)
+        guard self.manager === manager, streamingSessionId == session,
+              chatId == (conversationId ?? conversation?.id) else { return }
 
         // Update title
         if !refreshed.title.isEmpty && refreshed.title != "New Chat" {
@@ -7310,13 +7333,29 @@ final class ChatViewModel {
         // first message's completion task was still running its delayed polls
         // while the second message was streaming, the fallback would pick up
         // the second message's content and write it into the first message.
-        let serverAssistant = refreshed.messages.first(where: { $0.id == assistantMessageId })
+        let serverAssistant = refreshed.history.message(id: assistantMessageId)
+            ?? refreshed.messages.first(where: { $0.id == assistantMessageId })
         if let serverAssistant {
+            let localNode = conversation?.history.nodes[assistantMessageId]
+            let localMessage = conversation?.messages.first(where: { $0.id == assistantMessageId })
+            let canRefreshContent = !serverAssistant.isStreaming
+                && (localNode?.done ?? !(localMessage?.isStreaming ?? false))
+                && originalContent == (localNode?.content ?? localMessage?.content)
             if !serverAssistant.sources.isEmpty {
                 appendSources(id: assistantMessageId, sources: serverAssistant.sources)
             }
             if !serverAssistant.followUps.isEmpty {
                 appendFollowUps(id: assistantMessageId, followUps: serverAssistant.followUps)
+            }
+            // Comparison peers need the same metadata even when not on the prompt branch.
+            conversation?.history.updateNode(id: assistantMessageId) { node in
+                if !serverAssistant.files.isEmpty { node.files = serverAssistant.files }
+                if node.usage == nil { node.usage = serverAssistant.usage }
+                if node.embeds.isEmpty { node.embeds = serverAssistant.embeds }
+                if canRefreshContent, !serverAssistant.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    node.content = serverAssistant.content
+                    node.output = refreshed.history.nodes[assistantMessageId]?.output ?? []
+                }
             }
             // Copy files from server (tool-generated images etc.)
             if !serverAssistant.files.isEmpty {
@@ -7329,7 +7368,7 @@ final class ChatViewModel {
             if let index = conversation?.messages.firstIndex(where: { $0.id == assistantMessageId }) {
                 let localContent = conversation?.messages[index].content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let serverContent = serverAssistant.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !serverContent.isEmpty && serverContent != localContent {
+                if canRefreshContent && !serverContent.isEmpty && serverContent != localContent {
                     conversation?.messages[index].content = serverAssistant.content
                 }
                 // Copy usage stats from server — the server stores them after
@@ -7394,14 +7433,19 @@ final class ChatViewModel {
     }
 
     private func appendSources(id: String, sources: [ChatSourceReference]) {
-        guard let index = conversation?.messages.firstIndex(where: { $0.id == id }) else { return }
+        let index = conversation?.messages.firstIndex(where: { $0.id == id })
+        guard index != nil || conversation?.history.nodes[id] != nil else { return }
+        var merged = index.flatMap { conversation?.messages[$0].sources }
+            ?? conversation?.history.nodes[id]?.sources ?? []
         for source in sources {
-            if !conversation!.messages[index].sources.contains(where: {
+            if !merged.contains(where: {
                 ($0.url != nil && $0.url == source.url) || ($0.id != nil && $0.id == source.id)
             }) {
-                conversation?.messages[index].sources.append(source)
+                merged.append(source)
             }
         }
+        conversation?.history.nodes[id]?.sources = merged
+        if let index { conversation?.messages[index].sources = merged }
         // Mirror into streamingStore so IsolatedAssistantMessage has sources
         // both during streaming AND in the post-stream handoff window before
         // the final message commit propagates back through the view hierarchy.

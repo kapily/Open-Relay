@@ -834,29 +834,12 @@ final class APIClient: @unchecked Sendable {
         messages: [ChatMessage],
         chatParams: ChatAdvancedParams? = nil,
         folderId: String? = nil,
-        chatFiles: [ChatMessageFile] = []
+        chatFiles: [ChatMessageFile] = [],
+        models: [String]? = nil
     ) async throws -> Conversation {
         // Build flat messages array
-        let flatMessages = history.createMessagesList()
-        let messagesArray: [[String: Any]] = flatMessages.map { msg in
-            var dict: [String: Any] = [
-                "id": msg.id,
-                "parentId": (msg.parentId as Any?) ?? NSNull(),
-                "childrenIds": [String](),
-                "role": msg.role.rawValue,
-                "content": msg.content,
-                "timestamp": Int(msg.timestamp.timeIntervalSince1970)
-            ]
-            if msg.role == .assistant {
-                if let m = msg.model { dict["model"] = m; dict["modelName"] = m }
-                dict["modelIdx"] = 0
-                dict["done"] = true
-            }
-            if msg.role == .user, let m = model { dict["models"] = [m] }
-            if let usage = msg.usage, !usage.isEmpty { dict["usage"] = usage }
-            if !msg.followUps.isEmpty { dict["followUps"] = msg.followUps }
-            if !msg.files.isEmpty { dict["files"] = msg.files.map(\.serverDictionary) }
-            return dict
+        let messagesArray = history.createMessagesList().compactMap { message in
+            history.nodes[message.id]?.toServerDict()
         }
 
         // Build params dict
@@ -868,7 +851,7 @@ final class APIClient: @unchecked Sendable {
         let chatData: [String: Any] = [
             "id": id,
             "title": title,
-            "models": model.map { [$0] } ?? [],
+            "models": models ?? model.map { [$0] } ?? [],
             "params": paramsDict,
             "history": history.toServerDict(),
             "messages": messagesArray,
@@ -904,13 +887,15 @@ final class APIClient: @unchecked Sendable {
         messages: [ChatMessage],
         model: String? = nil,
         systemPrompt: String? = nil,
-        folderId: String? = nil
+        folderId: String? = nil,
+        models: [String]? = nil
     ) async throws -> Conversation {
         let chatData = buildChatPayload(
             title: title,
             messages: messages,
             model: model,
-            systemPrompt: systemPrompt
+            systemPrompt: systemPrompt,
+            models: models
         )
 
         var body: [String: Any] = ["chat": chatData]
@@ -1100,7 +1085,8 @@ final class APIClient: @unchecked Sendable {
         systemPrompt: String? = nil,
         chatParams: ChatAdvancedParams? = nil,
         title: String? = nil,
-        chatFiles: [ChatMessageFile] = []
+        chatFiles: [ChatMessageFile] = [],
+        models: [String]? = nil
     ) async throws {
         let chatData = buildChatPayload(
             title: title ?? "",
@@ -1108,7 +1094,8 @@ final class APIClient: @unchecked Sendable {
             model: model,
             systemPrompt: systemPrompt,
             chatParams: chatParams,
-            chatFiles: chatFiles
+            chatFiles: chatFiles,
+            models: models
         )
         try await network.requestVoidJSON(
             path: "/api/v1/chats/\(id)",
@@ -1130,18 +1117,12 @@ final class APIClient: @unchecked Sendable {
         systemPrompt: String? = nil,
         chatParams: ChatAdvancedParams? = nil,
         title: String? = nil,
-        chatFiles: [ChatMessageFile] = []
+        chatFiles: [ChatMessageFile] = [],
+        models: [String]? = nil
     ) async throws {
         // Build the flat messages array from the current branch (for server compat)
-        let flatMessages = history.createMessagesList()
-        let messagesArray: [[String: Any]] = flatMessages.map { msg in
-            var dict: [String: Any] = [
-                "role": msg.role.rawValue,
-                "content": msg.content
-            ]
-            if let model = msg.model { dict["model"] = model }
-            if !msg.files.isEmpty { dict["files"] = msg.files.map(\.serverDictionary) }
-            return dict
+        let messagesArray = history.createMessagesList().compactMap { message in
+            history.nodes[message.id]?.toServerDict()
         }
 
         // Build params dict
@@ -1158,7 +1139,7 @@ final class APIClient: @unchecked Sendable {
         var chat: [String: Any] = [
             "id": "",
             "title": title ?? "",
-            "models": model.map { [$0] } ?? [],
+            "models": models ?? model.map { [$0] } ?? [],
             "params": paramsDict,
             "history": history.toServerDict(),
             "messages": messagesArray,
@@ -1529,19 +1510,14 @@ final class APIClient: @unchecked Sendable {
         let archived = json["archived"] as? Bool ?? false
         let tags = json["tags"] as? [String] ?? []
 
-        var model: String?
-        if let chat = json["chat"] as? [String: Any],
-           let models = chat["models"] as? [String],
-           let first = models.first {
-            model = first
-        }
+        let models = (json["chat"] as? [String: Any])?["models"] as? [String] ?? []
 
         return Conversation(
             id: id,
             title: title,
             createdAt: createdAt,
             updatedAt: updatedAt,
-            model: model,
+            models: models,
             pinned: pinned,
             archived: archived,
             folderId: folderId,
@@ -4161,19 +4137,14 @@ final class APIClient: @unchecked Sendable {
             return []
         }()
 
-        var model: String?
-        if let chat = json["chat"] as? [String: Any],
-           let models = chat["models"] as? [String],
-           let first = models.first {
-            model = first
-        }
+        let models = (json["chat"] as? [String: Any])?["models"] as? [String] ?? []
 
         return Conversation(
             id: id,
             title: title,
             createdAt: createdAt,
             updatedAt: updatedAt,
-            model: model,
+            models: models,
             pinned: pinned,
             archived: archived,
             folderId: folderId,
@@ -4204,16 +4175,14 @@ final class APIClient: @unchecked Sendable {
             return []
         }()
 
-        var model: String?
+        var models: [String] = []
         var systemPrompt: String?
         var history = MessageHistory()
         var messages: [ChatMessage] = []
         var chatParams: ChatAdvancedParams?
 
         if let chat = json["chat"] as? [String: Any] {
-            if let models = chat["models"] as? [String], let first = models.first {
-                model = first
-            }
+            models = chat["models"] as? [String] ?? []
             systemPrompt = chat["system"] as? String
 
             // Parse the history tree directly into MessageHistory
@@ -4267,7 +4236,7 @@ final class APIClient: @unchecked Sendable {
             title: title,
             createdAt: createdAt,
             updatedAt: updatedAt,
-            model: model,
+            models: models,
             systemPrompt: systemPrompt,
             history: history,
             messages: messages,
@@ -4718,8 +4687,10 @@ final class APIClient: @unchecked Sendable {
         model: String?,
         systemPrompt: String?,
         chatParams: ChatAdvancedParams? = nil,
-        chatFiles: [ChatMessageFile] = []
+        chatFiles: [ChatMessageFile] = [],
+        models: [String]? = nil
     ) -> [String: Any] {
+        let selectedModels = models ?? model.map { [$0] } ?? []
         var messagesMap: [String: Any] = [:]
         var messagesArray: [[String: Any]] = []
         var previousId: String?
@@ -4752,12 +4723,11 @@ final class APIClient: @unchecked Sendable {
 
             if msg.role == .assistant {
                 if let m = msg.model { msgDict["model"] = m; msgDict["modelName"] = m }
-                msgDict["modelIdx"] = 0
                 msgDict["done"] = true
             }
 
-            if msg.role == .user, let m = model {
-                msgDict["models"] = [m]
+            if msg.role == .user {
+                msgDict["models"] = selectedModels
             }
 
             if !msg.files.isEmpty {
@@ -4834,13 +4804,12 @@ final class APIClient: @unchecked Sendable {
                         "content": version.content,
                         "timestamp": Int(version.timestamp.timeIntervalSince1970)
                     ]
-                    if msg.role == .user, let m = model {
-                        siblingDict["models"] = [m]
+                    if msg.role == .user {
+                        siblingDict["models"] = selectedModels
                     }
                     if let m = version.model ?? msg.model, msg.role == .assistant {
                         siblingDict["model"] = m
                         siblingDict["modelName"] = m
-                        siblingDict["modelIdx"] = 0
                         siblingDict["done"] = true
                     }
                     if !version.files.isEmpty {
@@ -4904,7 +4873,7 @@ final class APIClient: @unchecked Sendable {
         var chat: [String: Any] = [
             "id": "",
             "title": title,
-            "models": model.map { [$0] } ?? [],
+            "models": selectedModels,
             "params": paramsDict,
             "history": [
                 "messages": messagesMap,

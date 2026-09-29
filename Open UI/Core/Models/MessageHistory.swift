@@ -241,64 +241,29 @@ nonisolated struct MessageHistory: Sendable {
         }
         chain.reverse()
 
-        // Convert each node to ChatMessage with versions from siblings
-        return chain.compactMap { id -> ChatMessage? in
-            guard let node = nodes[id] else { return nil }
+        return chain.compactMap { message(id: $0) }
+    }
 
-            // Build versions from sibling nodes (same parent, same role, differeznt ID)
-            let siblingIds = siblings(of: id)
-            var versions: [ChatMessageVersion] = []
-            for sibId in siblingIds where sibId != id {
-                guard let sibNode = nodes[sibId] else { continue }
-                let version = ChatMessageVersion(
-                    id: sibNode.id,
-                    content: sibNode.content,
-                    timestamp: sibNode.timestamp,
-                    model: sibNode.model,
-                    error: sibNode.error,
-                    files: sibNode.files,
-                    sources: sibNode.sources,
-                    followUps: sibNode.followUps,
-                    statusHistory: sibNode.statusHistory,
-                    usage: sibNode.usage
-                )
-
-                // The tree is the source of truth for branching. Navigation between
-                // edit/regen branches uses restoreUserVersion/restoreAssistantVersion
-                // which call deepestLeaf() and re-derive the flat list from the tree.
-                // The version object carries only the sibling node's own content/metadata.
-                versions.append(version)
-            }
-
-            // Sort versions by timestamp (oldest first) for both user and assistant,
-            // so versions[0] is always the oldest sibling and the index matches
-            // the timestamp-based displayIndex calculation in the action bar.
-            if !versions.isEmpty {
-                versions.sort { $0.timestamp < $1.timestamp }
-            }
-
-            return ChatMessage(
-                id: node.id,
-                parentId: node.parentId,
-                role: node.role,
-                content: node.content,
-                timestamp: node.timestamp,
-                model: node.model,
-                isStreaming: !node.done,
-                files: node.files,
-                sources: node.sources,
-                statusHistory: node.statusHistory,
-                followUps: node.followUps,
-                error: node.error,
-                versions: versions,
-                usage: node.usage,
-                embeds: node.embeds,
-                annotation: node.annotation,
-                feedbackId: node.feedbackId,
-                isInternalMessage: node.isInternalMessage,
-                subagentDelegationId: node.subagentDelegationId
-            )
+    /// Reads one response, including an inactive comparison column, without walking
+    /// the entire conversation or changing the branch used for the next prompt.
+    func message(id: String) -> ChatMessage? {
+        guard let node = nodes[id] else { return nil }
+        let versions = versionSiblings(of: id).filter { $0 != id }.compactMap { nodes[$0] }
+            .sorted { $0.timestamp < $1.timestamp }
+            .map { sibling in
+                ChatMessageVersion(
+                    id: sibling.id, content: sibling.content, timestamp: sibling.timestamp,
+                    model: sibling.model, error: sibling.error, files: sibling.files,
+                    sources: sibling.sources, followUps: sibling.followUps,
+                    statusHistory: sibling.statusHistory, usage: sibling.usage)
         }
+        return ChatMessage(
+            id: node.id, parentId: node.parentId, role: node.role, content: node.content,
+            timestamp: node.timestamp, model: node.model, isStreaming: !node.done,
+            files: node.files, sources: node.sources, statusHistory: node.statusHistory,
+            followUps: node.followUps, error: node.error, versions: versions, usage: node.usage,
+            embeds: node.embeds, annotation: node.annotation, feedbackId: node.feedbackId,
+            isInternalMessage: node.isInternalMessage, subagentDelegationId: node.subagentDelegationId)
     }
 
     /// Returns all sibling IDs of a node (children of the same parent with the same role).
@@ -322,6 +287,41 @@ nonisolated struct MessageHistory: Sendable {
                 .sorted { $0.timestamp < $1.timestamp }
                 .map(\.id)
         }
+    }
+
+    /// A comparison column contains regenerations of one ordered model slot.
+    /// Message IDs, not model names, keep duplicate model selections independent.
+    struct ResponseColumn: Identifiable, Equatable {
+        var id: Int
+        var modelId: String
+        var messageIds: [String]
+
+        func selectedMessageId(preferring messageId: String?) -> String? {
+            if let messageId, messageIds.contains(messageId) { return messageId }
+            return messageIds.last
+        }
+    }
+
+    func responseColumns(for userMessageId: String) -> [ResponseColumn] {
+        guard let parent = nodes[userMessageId], parent.role == .user else { return [] }
+        let responses = parent.childrenIds.compactMap { nodes[$0] }.filter { $0.role == .assistant }
+        return parent.models.enumerated().map { index, model in
+            let indexed = responses.filter { $0.modelIndex == index }
+            let matching = indexed.isEmpty
+                ? responses.filter { $0.modelIndex == nil && $0.model == model }
+                : indexed
+            return ResponseColumn(id: index, modelId: model, messageIds: matching.map(\.id))
+        }
+    }
+
+    /// Version arrows stay inside a comparison slot, rather than switching models.
+    func versionSiblings(of nodeId: String) -> [String] {
+        if let node = nodes[nodeId], node.role == .assistant, let parentId = node.parentId,
+           let parent = nodes[parentId], parent.models.count > 1,
+           let column = responseColumns(for: parentId).first(where: { $0.messageIds.contains(nodeId) }) {
+            return column.messageIds
+        }
+        return siblings(of: nodeId)
     }
 
     /// Walks from a node to its deepest leaf by always following the last child.

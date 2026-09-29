@@ -24,7 +24,13 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
     var title: String
     var createdAt: Date
     var updatedAt: Date
-    var model: String?
+    /// Ordered comparison slots. Duplicate model IDs represent distinct responses.
+    var models: [String]
+    /// Compatibility accessor for callers explicitly choosing a single model.
+    var model: String? {
+        get { models.first }
+        set { models = newValue.map { [$0] } ?? [] }
+    }
     var systemPrompt: String?
 
     /// The tree-based message history — **source of truth** for all messages.
@@ -66,6 +72,7 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
         createdAt: Date = .now,
         updatedAt: Date = .now,
         model: String? = nil,
+        models: [String]? = nil,
         systemPrompt: String? = nil,
         history: MessageHistory = MessageHistory(),
         messages: [ChatMessage] = [],
@@ -81,7 +88,7 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
         self.title = title
         self.createdAt = createdAt
         self.updatedAt = updatedAt
-        self.model = model
+        self.models = models ?? model.map { [$0] } ?? []
         self.systemPrompt = systemPrompt
         self.history = history
         self.messages = messages
@@ -107,7 +114,7 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
 
     /// Returns the sibling IDs for a given message in the history tree.
     func siblings(of messageId: String) -> [String] {
-        history.siblings(of: messageId)
+        history.versionSiblings(of: messageId)
     }
 
     // Hashable: includes messages count and title so SwiftUI
@@ -115,12 +122,14 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
     static func == (lhs: Conversation, rhs: Conversation) -> Bool {
         lhs.id == rhs.id
             && lhs.title == rhs.title
+            && lhs.models == rhs.models
             && lhs.messages == rhs.messages
             && lhs.tasks == rhs.tasks
     }
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
+        hasher.combine(models)
         hasher.combine(messages.count)
         hasher.combine(tasks.count)
     }

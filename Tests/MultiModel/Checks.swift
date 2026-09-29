@@ -66,6 +66,36 @@ enum InlineImageStore {
         check(reopened.nodes["right"]?.content == source["content"] as? String,
               "inactive response content is preserved")
         check(reopened.nodes["right-retry"]?.done == true, "completion state is preserved")
+        check(reopened.createMessagesList().last?.versions.map(\.id) == ["right"],
+              "regeneration versions do not include a different comparison column")
+        let columns = reopened.responseColumns(for: "question")
+        check(columns.count == 2, "duplicate model IDs produce two comparison columns")
+        check(columns[0].messageIds == ["left"], "first column owns only its responses")
+        check(columns[1].messageIds == ["right", "right-retry"], "second column includes only its regenerations")
+        check(columns[1].selectedMessageId(preferring: "right") == "right", "selected older version stays selected")
+        check(columns[1].selectedMessageId(preferring: "left") == "right-retry", "other column defaults to latest regeneration")
+        check(reopened.siblings(of: "left") == ["left", "right", "right-retry"], "tree sibling relationships remain intact")
+        var missing = reopened
+        missing.nodes.removeValue(forKey: "left")
+        check(missing.responseColumns(for: "question")[0].messageIds.isEmpty,
+              "missing column never borrows an explicitly indexed duplicate-model response")
+        var legacyTree = reopened
+        legacyTree.nodes["question"]?.models = ["other-model", "craft-model"]
+        legacyTree.nodes["left"]?.model = "other-model"
+        for id in ["left", "right", "right-retry"] { legacyTree.nodes[id]?.modelIndex = nil }
+        check(legacyTree.responseColumns(for: "question")[0].messageIds == ["left"], "legacy first column falls back to model identity")
+        check(legacyTree.responseColumns(for: "question")[1].messageIds == ["right", "right-retry"], "legacy second column retains regenerations")
+        check(reopened.responseColumns(for: "right").isEmpty, "only user turns define comparison columns")
+        var ordinary = reopened
+        ordinary.nodes["question"]?.models = ["craft-model"]
+        check(ordinary.versionSiblings(of: "right").count == 3, "single-model version navigation remains unchanged")
+        let inactive = reopened.message(id: "left")
+        check(inactive?.id == "left" && inactive?.content == source["content"] as? String,
+              "single-node conversion reads an inactive response without a full branch walk")
+        check(reopened.currentId == "right-retry", "reading a comparison does not change prompt selection")
+        check(reopened.message(id: "missing") == nil, "missing response does not fall back to another column")
+        check(reopened.message(id: "right")?.versions.map(\.id) == ["right-retry"],
+              "inactive response uses the same column-local versions as the active branch")
 
         var request = ChatCompletionRequest(model: "craft-model", messages: [
             ["role": "user", "content": "Describe a paper fold."]

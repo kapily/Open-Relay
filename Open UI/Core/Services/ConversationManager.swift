@@ -37,14 +37,16 @@ final class ConversationManager: @unchecked Sendable {
         messages: [ChatMessage] = [],
         model: String? = nil,
         systemPrompt: String? = nil,
-        folderId: String? = nil
+        folderId: String? = nil,
+        models: [String]? = nil
     ) async throws -> Conversation {
         try await apiClient.createConversation(
             title: title,
             messages: messages,
             model: model,
             systemPrompt: systemPrompt,
-            folderId: folderId
+            folderId: folderId,
+            models: models
         )
     }
 
@@ -59,13 +61,18 @@ final class ConversationManager: @unchecked Sendable {
     }
 
     func saveConversation(_ conversation: Conversation) async throws {
+        if conversation.history.isPopulated {
+            try await syncConversationHistory(conversation)
+            return
+        }
         try await apiClient.syncConversationMessages(
             id: conversation.id,
             messages: conversation.messages,
             model: conversation.model,
             systemPrompt: conversation.systemPrompt,
             title: conversation.title,
-            chatFiles: conversation.files
+            chatFiles: conversation.files,
+            models: conversation.models
         )
     }
 
@@ -79,7 +86,8 @@ final class ConversationManager: @unchecked Sendable {
             systemPrompt: conversation.systemPrompt,
             chatParams: conversation.chatParams,
             title: conversation.title,
-            chatFiles: conversation.files
+            chatFiles: conversation.files,
+            models: conversation.models
         )
     }
 
@@ -181,7 +189,8 @@ final class ConversationManager: @unchecked Sendable {
         systemPrompt: String? = nil,
         title: String? = nil,
         chatParams: ChatAdvancedParams? = nil,
-        chatFiles: [ChatMessageFile] = []
+        chatFiles: [ChatMessageFile] = [],
+        models: [String]? = nil
     ) async throws {
         try await apiClient.syncConversationMessages(
             id: id,
@@ -190,7 +199,8 @@ final class ConversationManager: @unchecked Sendable {
             systemPrompt: systemPrompt,
             chatParams: chatParams,
             title: title,
-            chatFiles: chatFiles
+            chatFiles: chatFiles,
+            models: models
         )
     }
 
