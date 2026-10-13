@@ -668,11 +668,11 @@ final class ChatViewModel {
     /// Calling this before any `syncToServerViaTree()` ensures we never overwrite the
     /// server's good data with stale/empty tree nodes.
     private func syncFlatMessagesToTreeNodes() {
-        guard conversation?.history.isPopulated == true else { return }
+        guard var history = conversation?.history, history.isPopulated else { return }
         for msg in conversation?.messages ?? [] {
             // Only update if this node actually exists in the tree
-            guard conversation?.history.nodes[msg.id] != nil else { continue }
-            conversation?.history.updateNode(id: msg.id) { node in
+            guard history.nodes[msg.id] != nil else { continue }
+            history.updateNode(id: msg.id) { node in
                 // Don't overwrite non-empty tree node content with an empty flat message
                 // (this protects nodes on inactive branches that are absent from flat messages)
                 if !msg.content.isEmpty {
@@ -688,6 +688,7 @@ final class ChatViewModel {
                 if !msg.followUps.isEmpty { node.followUps = msg.followUps }
             }
         }
+        conversation?.history = history
     }
 
     @discardableResult
@@ -1672,9 +1673,8 @@ final class ChatViewModel {
                 // may return stale/corrupted data during streaming that would
                 // replace the first message's content with the second message's
                 // streaming content — causing the "duplicate stream" bug.
-                let isLocallyComplete = !local.isStreaming && local.role == .assistant
+                let skipContentUpdate = isStreaming && !local.isStreaming && local.role == .assistant
                     && !local.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                let skipContentUpdate = isLocallyComplete && isStreaming
 
                 if !skipContentUpdate && local.content != serverMsg.content {
                     conversation!.messages[localIdx].content = serverMsg.content
@@ -1805,7 +1805,7 @@ final class ChatViewModel {
         if !isStreaming, conversation?.history.isPopulated == true {
             let treeMessages = conversation!.history.createMessagesList()
             if treeMessages.count > (conversation?.messages.count ?? 0) {
-                conversation!.rederiveMessages()
+                conversation!.messages = treeMessages
                 logger.info("adoptServerMessages: re-derived \(treeMessages.count) messages from tree (was \(self.conversation?.messages.count ?? 0) from flat array)")
                 // Push the updated currentId to server so WebUI also shows the full branch.
                 if conversation?.hasDeferredDetails != true { Task { await self.syncCurrentIdToServer() } }
